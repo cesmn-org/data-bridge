@@ -20,23 +20,24 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install libfetch
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install "git+https://github.com/cesmn-org/libfetch.git"
+          python -m pip install pandas pyarrow
 
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Fetch and process MealConnect customer report
+      - name: Fetch, process, and generate Parquet
         env:
           MEALCONNECT_USERNAME: ${{ secrets.MEALCONNECT_USERNAME }}
           MEALCONNECT_PASSWORD: ${{ secrets.MEALCONNECT_PASSWORD }}
         run: |
           python - <<'PY'
           import os
-          import csv
           import io
+          import pandas as pd
           from libfetch import OAOrders
 
           username = os.environ["MEALCONNECT_USERNAME"]
@@ -45,6 +46,7 @@ jobs:
           if not username or not password:
               raise RuntimeError("MealConnect credentials are missing")
 
+          # Fetch report.
           fetcher = OAOrders(username, password).fetch()
           data = fetcher.to_bytes()
 
@@ -67,59 +69,72 @@ jobs:
               "PrimaryDeliveryInstructions",
           }
 
-          # Parse source CSV in memory.
-          reader = csv.DictReader(
-              io.StringIO(data.decode("utf-8-sig"))
+          # Read all values as strings to preserve their original values.
+          df = pd.read_csv(
+              io.BytesIO(data),
+              dtype=str,
+              keep_default_na=False,
+              encoding="utf-8-sig",
           )
 
-          headers = reader.fieldnames
-
-          if not headers or "ID" not in headers:
+          if "ID" not in df.columns:
               raise RuntimeError("Expected customer ID column is missing")
 
-          missing = remove_columns - set(headers)
+          missing = remove_columns - set(df.columns)
           if missing:
               raise RuntimeError(
                   f"Expected identifier columns are missing: {sorted(missing)}"
               )
 
-          # Remove direct identifiers, preserving all other columns.
-          output_headers = [
-              column for column in headers
-              if column not in remove_columns
-          ]
+          original_rows = len(df)
 
-          output = io.StringIO(newline="")
-          writer = csv.DictWriter(output, fieldnames=output_headers)
-          writer.writeheader()
+          # Remove direct identifiers.
+          df = df.drop(columns=list(remove_columns))
 
-          row_count = 0
-
-          for row in reader:
-              output_row = {
-                  column: row[column]
-                  for column in output_headers
-              }
-              writer.writerow(output_row)
-              row_count += 1
-
-          # Processed CSV remains in memory.
-          processed_csv = output.getvalue()
-
-          # Verify resulting structure.
-          if len(output_headers) != 53:
+          # Verify processed structure.
+          if len(df.columns) != 53:
               raise RuntimeError(
-                  f"Unexpected output column count: {len(output_headers)}"
+                  f"Unexpected output column count: {len(df.columns)}"
               )
 
-          if any(column in output_headers for column in remove_columns):
+          if len(df) != original_rows:
+              raise RuntimeError("Row count changed during processing")
+
+          if any(column in df.columns for column in remove_columns):
               raise RuntimeError("Direct identifiers remain in output")
 
-          print("Fetch and processing successful")
+          # Generate Parquet entirely in memory.
+          parquet_buffer = io.BytesIO()
+          df.to_parquet(
+              parquet_buffer,
+              engine="pyarrow",
+              index=False,
+          )
+
+          parquet_data = parquet_buffer.getvalue()
+
+          if not parquet_data:
+              raise RuntimeError("Parquet generation produced an empty file")
+
+          # Read Parquet back and verify it.
+          verified = pd.read_parquet(
+              io.BytesIO(parquet_data),
+              engine="pyarrow",
+          )
+
+          if len(verified) != original_rows:
+              raise RuntimeError("Parquet row count verification failed")
+
+          if list(verified.columns) != list(df.columns):
+              raise RuntimeError("Parquet column verification failed")
+
+          print("Fetch and Parquet generation successful")
           print(f"Source filename: {fetcher.suggested_filename}")
           print(f"Source bytes: {len(data)}")
-          print(f"Processed rows: {row_count}")
-          print(f"Processed columns: {len(output_headers)}")
+          print(f"Parquet bytes: {len(parquet_data)}")
+          print(f"Rows: {len(verified)}")
+          print(f"Columns: {len(verified.columns)}")
           print("Direct identifiers removed: 12")
-          print("All other fields preserved")
+          print("All remaining values preserved as strings")
+          print("Parquet read-back verification: passed")
           PY
