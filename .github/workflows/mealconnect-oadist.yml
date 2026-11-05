@@ -1,0 +1,76 @@
+
+name: MealConnect OADist Fetcher
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-oadist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out data-bridge
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install libfetch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "git+https://github.com/cesmn-org/libfetch.git"
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Fetch and inspect MealConnect distribution report
+        env:
+          MEALCONNECT_USERNAME: ${{ secrets.MEALCONNECT_USERNAME }}
+          MEALCONNECT_PASSWORD: ${{ secrets.MEALCONNECT_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import os
+          import csv
+          import io
+          from libfetch import OADist
+
+          username = os.environ["MEALCONNECT_USERNAME"]
+          password = os.environ["MEALCONNECT_PASSWORD"]
+
+          if not username or not password:
+              raise RuntimeError("MealConnect credentials are missing")
+
+          fetcher = OADist(username, password).fetch()
+          data = fetcher.to_bytes()
+
+          if not data:
+              raise RuntimeError("The downloaded report is empty")
+
+          # Parse CSV entirely in memory.
+          reader = csv.reader(
+              io.StringIO(data.decode("utf-8-sig"))
+          )
+
+          headers = next(reader, None)
+
+          if not headers:
+              raise RuntimeError("The CSV has no header row")
+
+          row_count = sum(1 for row in reader if row)
+
+          print("Fetch successful")
+          print(f"Filename: {fetcher.suggested_filename}")
+          print(f"Downloaded bytes: {len(data)}")
+          print(f"Columns ({len(headers)}):")
+
+          for header in headers:
+              print(f"  - {header}")
+
+          print(f"Data rows: {row_count}")
+          PY
