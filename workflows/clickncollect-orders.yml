@@ -1,0 +1,79 @@
+
+name: Click & Collect Orders Fetcher
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-cnc-orders:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out data-bridge
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "git+https://github.com/cesmn-org/libfetch.git"
+          python -m pip install pandas openpyxl
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Fetch and inspect Click & Collect report
+        env:
+          CNC_USERNAME: ${{ secrets.CNC_USERNAME }}
+          CNC_PASSWORD: ${{ secrets.CNC_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import os
+          import io
+
+          import pandas as pd
+          from libfetch import CNCOrders
+
+          username = os.environ["CNC_USERNAME"]
+          password = os.environ["CNC_PASSWORD"]
+
+          if not username or not password:
+              raise RuntimeError("Click & Collect credentials are missing")
+
+          fetcher = CNCOrders(username, password).fetch()
+          data = fetcher.to_bytes()
+
+          if not data:
+              raise RuntimeError("The downloaded report is empty")
+
+          # Read the Excel report without converting values unnecessarily.
+          df = pd.read_excel(
+              io.BytesIO(data),
+              dtype=str,
+              keep_default_na=False,
+          )
+
+          if len(df.columns) == 0:
+              raise RuntimeError("The Excel report has no columns")
+
+          if len(df) == 0:
+              raise RuntimeError("The Excel report contains no data rows")
+
+          print("Fetch successful")
+          print(f"Filename: {fetcher.suggested_filename}")
+          print(f"Downloaded bytes: {len(data)}")
+          print(f"Columns ({len(df.columns)}):")
+
+          for column in df.columns:
+              print(f"  - {column}")
+
+          print(f"Data rows: {len(df)}")
+          PY
