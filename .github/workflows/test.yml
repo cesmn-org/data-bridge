@@ -36,6 +36,8 @@ jobs:
         run: |
           python - <<'PY'
           import os
+          import csv
+          import io
           from libfetch import OAOrders
 
           username = os.environ["MEALCONNECT_USERNAME"]
@@ -50,7 +52,21 @@ jobs:
           if not data:
               raise RuntimeError("The downloaded report is empty")
 
+          # Parse the CSV entirely in memory.
+          text = data.decode("utf-8-sig")
+          reader = csv.reader(io.StringIO(text))
+
+          headers = next(reader, None)
+          if not headers:
+              raise RuntimeError("The CSV has no header row")
+
+          row_count = sum(1 for row in reader if row)
+
           print("Fetch successful")
           print(f"Filename: {fetcher.suggested_filename}")
           print(f"Downloaded bytes: {len(data)}")
+          print(f"Columns ({len(headers)}):")
+          for header in headers:
+              print(f"  - {header}")
+          print(f"Data rows: {row_count}")
           PY
