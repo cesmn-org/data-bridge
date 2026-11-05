@@ -1,0 +1,56 @@
+
+name: Test MealConnect OAOrders Fetcher
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-oaorders:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out data-bridge
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install libfetch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "git+https://github.com/cesmn-org/libfetch.git"
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Fetch MealConnect customer report
+        env:
+          MEALCONNECT_USERNAME: ${{ secrets.MEALCONNECT_USERNAME }}
+          MEALCONNECT_PASSWORD: ${{ secrets.MEALCONNECT_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import os
+          from libfetch import OAOrders
+
+          username = os.environ["MEALCONNECT_USERNAME"]
+          password = os.environ["MEALCONNECT_PASSWORD"]
+
+          if not username or not password:
+              raise RuntimeError("MealConnect credentials are missing")
+
+          fetcher = OAOrders(username, password).fetch()
+          data = fetcher.to_bytes()
+
+          if not data:
+              raise RuntimeError("The downloaded report is empty")
+
+          print("Fetch successful")
+          print(f"Filename: {fetcher.suggested_filename}")
+          print(f"Downloaded bytes: {len(data)}")
+          PY
