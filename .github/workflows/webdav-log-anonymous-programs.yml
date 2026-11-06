@@ -1,0 +1,81 @@
+
+name: WebDAV LogAnonymousPrograms Fetcher
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-log-anonymous-programs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out data-bridge
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "git+https://github.com/cesmn-org/libfetch.git"
+          python -m pip install pandas openpyxl
+
+      - name: Fetch and inspect LogAnonymousPrograms report
+        env:
+          WEBDAV_USERNAME: ${{ secrets.WEBDAV_USERNAME }}
+          WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import os
+          import io
+
+          import pandas as pd
+          from libfetch import LogAnonymousPrograms
+
+          username = os.environ["WEBDAV_USERNAME"]
+          password = os.environ["WEBDAV_PASSWORD"]
+
+          if not username or not password:
+              raise RuntimeError("WebDAV credentials are missing")
+
+          fetcher = LogAnonymousPrograms(username, password).fetch()
+          data = fetcher.to_bytes()
+
+          if not data:
+              raise RuntimeError("The downloaded report is empty")
+
+          workbook = pd.ExcelFile(io.BytesIO(data))
+
+          print("Fetch successful")
+          print(f"Filename: {fetcher.suggested_filename}")
+          print(f"Downloaded bytes: {len(data)}")
+          print(f"Worksheets: {workbook.sheet_names}")
+
+          for sheet in workbook.sheet_names:
+              if sheet == "Config":
+                  print("\nConfig worksheet: excluded")
+                  continue
+
+              df = pd.read_excel(
+                  workbook,
+                  sheet_name=sheet,
+                  skiprows=2,
+                  dtype=str,
+                  keep_default_na=False,
+              )
+
+              print(f"\nWorksheet: {sheet}")
+              print(f"Columns ({len(df.columns)}):")
+
+              for column in df.columns:
+                  print(f"  - {column}")
+
+              print(f"Data rows: {len(df)}")
+          PY
