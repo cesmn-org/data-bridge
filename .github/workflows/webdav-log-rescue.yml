@@ -51,22 +51,27 @@ jobs:
           if not data:
               raise RuntimeError("The downloaded report is empty")
 
-          df = pd.read_excel(
-              io.BytesIO(data),
-              dtype=str,
-              keep_default_na=False,
-          )
-
-          if len(df.columns) == 0:
-              raise RuntimeError("The Excel report has no columns")
+          workbook = pd.ExcelFile(io.BytesIO(data))
 
           print("Fetch successful")
           print(f"Filename: {fetcher.suggested_filename}")
           print(f"Downloaded bytes: {len(data)}")
-          print(f"Columns ({len(df.columns)}):")
+          print(f"Worksheets: {workbook.sheet_names}")
 
-          for column in df.columns:
-              print(f"  - {column}")
+          for sheet in workbook.sheet_names:
+              df = pd.read_excel(
+                  workbook,
+                  sheet_name=sheet,
+                  skiprows=2,
+                  dtype=str,
+                  keep_default_na=False,
+              )
 
-          print(f"Data rows: {len(df)}")
+              print(f"\nWorksheet: {sheet}")
+              print(f"Columns ({len(df.columns)}):")
+
+              for column in df.columns:
+                  print(f"  - {column}")
+
+              print(f"Data rows: {len(df)}")
           PY
