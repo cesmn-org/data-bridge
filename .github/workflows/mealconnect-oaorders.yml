@@ -1,5 +1,5 @@
 
-name: Test MealConnect OAOrders Fetcher
+name: MealConnect OAOrders Fetcher
 
 on:
   workflow_dispatch:
