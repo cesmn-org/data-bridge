@@ -27,11 +27,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python3 -m pip install --disable-pip-version-check \
-            duckdb \
-            boto3
+          python3 -m pip install --disable-pip-version-check duckdb boto3
 
-      - name: Download catalog and inspect DuckLake metadata
+      - name: Download catalog and inspect DuckLake
         run: |
           python3 <<'PY'
           import os
@@ -103,6 +101,20 @@ jobs:
                   """,
               ),
               (
+                  "row_counts",
+                  """
+                  SELECT 'oa_distribution' AS table_name,
+                         COUNT(*) AS row_count
+                  FROM lake.oa_distribution
+
+                  UNION ALL
+
+                  SELECT 'log_anonymous_programs',
+                         COUNT(*)
+                  FROM lake.log_anonymous_programs;
+                  """,
+              ),
+              (
                   "data_files",
                   """
                   SELECT
@@ -146,6 +158,25 @@ jobs:
 
               report_lines.append("")
               print()
+
+          # List physical R2 objects so we can compare actual storage
+          # against the paths recorded in the DuckLake catalog.
+          print("--- r2_objects ---")
+          report_lines.append("--- r2_objects ---")
+
+          paginator = s3.get_paginator("list_objects_v2")
+          for page in paginator.paginate(
+              Bucket=os.environ["R2_BUCKET"],
+              Prefix="lakehouse/data/",
+          ):
+              for item in page.get("Contents", []):
+                  line = (
+                      f"{item['Key']}\t"
+                      f"{item['Size']} bytes\t"
+                      f"{item['LastModified']}"
+                  )
+                  print(line)
+                  report_lines.append(line)
 
           report_path.write_text(
               "\n".join(report_lines),
