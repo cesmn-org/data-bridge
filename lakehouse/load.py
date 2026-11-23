@@ -201,6 +201,46 @@ def load_anonymous_programs(
     )
 
 
+def verify_tables(
+    con: duckdb.DuckDBPyConnection,
+) -> dict[str, int]:
+    expected_tables = {
+        "oa_distribution",
+        "log_anonymous_programs",
+    }
+
+    actual_tables = {
+        row[0]
+        for row in con.execute(
+            "SHOW TABLES FROM lake"
+        ).fetchall()
+    }
+
+    missing_tables = expected_tables - actual_tables
+
+    if missing_tables:
+        raise RuntimeError(
+            "Expected DuckLake tables are missing: "
+            f"{sorted(missing_tables)}"
+        )
+
+    row_counts = {}
+
+    for table_name in sorted(expected_tables):
+        row_count = con.execute(
+            f"SELECT COUNT(*) FROM lake.{table_name}"
+        ).fetchone()[0]
+
+        row_counts[table_name] = row_count
+
+        if row_count == 0:
+            raise RuntimeError(
+                f"DuckLake table is empty: lake.{table_name}"
+            )
+
+    return row_counts
+
+
 def main() -> None:
     s3 = r2_client()
 
@@ -211,6 +251,16 @@ def main() -> None:
         )
 
         download_catalog(s3, catalog_path)
+
+        oa_distribution_objects = list_snapshot_objects(
+            s3,
+            OA_DISTRIBUTION_PREFIX,
+        )
+
+        anonymous_programs_objects = list_snapshot_objects(
+            s3,
+            ANONYMOUS_PROGRAMS_PREFIX,
+        )
 
         con = duckdb.connect()
 
@@ -226,16 +276,6 @@ def main() -> None:
                 """
             )
 
-            oa_distribution_objects = list_snapshot_objects(
-                s3,
-                OA_DISTRIBUTION_PREFIX,
-            )
-
-            anonymous_programs_objects = list_snapshot_objects(
-                s3,
-                ANONYMOUS_PROGRAMS_PREFIX,
-            )
-
             load_oa_distribution(
                 con,
                 oa_distribution_objects,
@@ -246,6 +286,8 @@ def main() -> None:
                 anonymous_programs_objects,
             )
 
+            row_counts = verify_tables(con)
+
             con.execute("CHECKPOINT")
 
         finally:
@@ -254,16 +296,10 @@ def main() -> None:
         upload_catalog(s3, catalog_path)
 
     print("Lakehouse load successful")
-    print("Loaded table: lake.oa_distribution")
-    print("Loaded table: lake.log_anonymous_programs")
-    print(
-        "OA Distribution snapshots: "
-        f"{len(oa_distribution_objects)}"
-    )
-    print(
-        "Anonymous Programs snapshots: "
-        f"{len(anonymous_programs_objects)}"
-    )
+    print("Verified tables:")
+
+    for table_name, row_count in row_counts.items():
+        print(f"  lake.{table_name}: {row_count} rows")
 
 
 if __name__ == "__main__":
