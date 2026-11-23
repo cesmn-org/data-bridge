@@ -1,5 +1,4 @@
-
-name: WebDAV LogWarehouse Fetcher
+name: WebDAV Log Warehouse Fetcher
 
 on:
   workflow_dispatch:
@@ -10,7 +9,6 @@ permissions:
 jobs:
   fetch-log-warehouse:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
 
     steps:
       - name: Check out data-bridge
@@ -24,209 +22,184 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "git+https://github.com/cesmn-org/libfetch.git"
-          python -m pip install pandas pyarrow boto3 openpyxl
+          python -m pip install \
+            "git+https://github.com/cesmn-org/libfetch.git" \
+            duckdb
 
-      - name: Fetch, process, generate Parquet, and upload to R2
+      - name: Fetch, transform, and upload Parquet
         env:
           WEBDAV_USERNAME: ${{ secrets.WEBDAV_USERNAME }}
           WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
           CLOUDFLARE_R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
           CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
           CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           python - <<'PY'
+          import csv
           import os
-          import io
+          import tempfile
           from datetime import datetime, timezone
+          from pathlib import Path
 
-          import boto3
-          import pandas as pd
-
-          from botocore.config import Config
+          import duckdb
           from libfetch import LogWarehouse
 
-          username = os.environ["WEBDAV_USERNAME"]
-          password = os.environ["WEBDAV_PASSWORD"]
 
-          account_id = os.environ["CLOUDFLARE_R2_ACCOUNT_ID"]
-          access_key = os.environ["CLOUDFLARE_R2_ACCESS_KEY_ID"]
-          secret_key = os.environ["CLOUDFLARE_R2_SECRET_ACCESS_KEY"]
-
-          bucket = "data-bridge"
-
-          required_values = {
-              "WEBDAV_USERNAME": username,
-              "WEBDAV_PASSWORD": password,
-              "CLOUDFLARE_R2_ACCOUNT_ID": account_id,
-              "CLOUDFLARE_R2_ACCESS_KEY_ID": access_key,
-              "CLOUDFLARE_R2_SECRET_ACCESS_KEY": secret_key,
-          }
-
-          missing = [
-              name for name, value in required_values.items()
-              if not value
+          expected_incoming_columns = [
+              "Date",
+              "Source",
+              "Transaction Type",
+              "Product Type",
+              "Pounds",
+              "Note",
           ]
 
-          if missing:
-              raise RuntimeError(
-                  f"Required secrets are missing: {', '.join(missing)}"
+          expected_outgoing_columns = [
+              "Date",
+              "Product Type",
+              "Pounds",
+              "Note",
+          ]
+
+          fetcher = LogWarehouse(
+              os.environ["WEBDAV_USERNAME"],
+              os.environ["WEBDAV_PASSWORD"],
+          ).fetch()
+
+          source_bytes = fetcher.to_bytes()
+
+          if not source_bytes:
+              raise RuntimeError("The downloaded workbook is empty")
+
+          with tempfile.NamedTemporaryFile(
+              mode="wb",
+              suffix=".xlsx",
+          ) as source_file:
+              source_file.write(source_bytes)
+              source_file.flush()
+
+              account_id = os.environ[
+                  "CLOUDFLARE_R2_ACCOUNT_ID"
+              ]
+
+              access_key = os.environ[
+                  "CLOUDFLARE_R2_ACCESS_KEY_ID"
+              ]
+
+              secret_key = os.environ[
+                  "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
+              ]
+
+              os.environ["AWS_ACCESS_KEY_ID"] = access_key
+              os.environ["AWS_SECRET_ACCESS_KEY"] = secret_key
+
+              timestamp = datetime.now(timezone.utc).strftime(
+                  "%Y-%m-%dT%H-%M-%SZ"
               )
 
-          expected_columns = {
-              "Log Incoming": [
-                  "Date",
-                  "Source",
-                  "Transaction Type",
-                  "Product Type",
-                  "Pounds",
-                  "Note",
-              ],
-              "Log Outgoing": [
-                  "Date",
-                  "Product Type",
-                  "Pounds",
-                  "Note",
-              ],
-          }
+              run_id = os.environ["GITHUB_RUN_ID"]
 
-          # Fetch the workbook.
-          fetcher = LogWarehouse(username, password).fetch()
-          data = fetcher.to_bytes()
-
-          if not data:
-              raise RuntimeError("The downloaded report is empty")
-
-          workbook = pd.ExcelFile(io.BytesIO(data))
-
-          # Generate and verify every Parquet file before uploading.
-          parquet_files = {}
-
-          for sheet, columns in expected_columns.items():
-              if sheet not in workbook.sheet_names:
-                  raise RuntimeError(
-                      f"Expected worksheet is missing: {sheet}"
-                  )
-
-              df = pd.read_excel(
-                  workbook,
-                  sheet_name=sheet,
-                  skiprows=2,
-                  dtype=str,
-                  keep_default_na=False,
+              incoming_output_path = (
+                  "r2://data-bridge/"
+                  "snapshots/webdav-log-warehouse-incoming/"
+                  f"{timestamp}-{run_id}.parquet"
               )
 
-              if list(df.columns) != columns:
-                  raise RuntimeError(
-                      f"Unexpected columns in {sheet}: {list(df.columns)}"
-                  )
-
-              if len(df) == 0:
-                  raise RuntimeError(
-                      f"Worksheet contains no data rows: {sheet}"
-                  )
-
-              parquet_buffer = io.BytesIO()
-
-              df.to_parquet(
-                  parquet_buffer,
-                  engine="pyarrow",
-                  index=False,
+              outgoing_output_path = (
+                  "r2://data-bridge/"
+                  "snapshots/webdav-log-warehouse-outgoing/"
+                  f"{timestamp}-{run_id}.parquet"
               )
 
-              parquet_data = parquet_buffer.getvalue()
+              con = duckdb.connect()
 
-              if not parquet_data:
-                  raise RuntimeError(
-                      f"Parquet generation produced an empty file: {sheet}"
+              try:
+                  con.execute("INSTALL excel")
+                  con.execute("LOAD excel")
+                  con.execute("INSTALL httpfs")
+                  con.execute("LOAD httpfs")
+
+                  con.execute(
+                      f"""
+                      CREATE OR REPLACE SECRET r2_secret (
+                          TYPE R2,
+                          PROVIDER credential_chain,
+                          CHAIN 'env',
+                          ACCOUNT_ID '{account_id}'
+                      )
+                      """
                   )
 
-              verified = pd.read_parquet(
-                  io.BytesIO(parquet_data),
-                  engine="pyarrow",
-              )
-
-              if len(verified) != len(df):
-                  raise RuntimeError(
-                      f"Row count verification failed: {sheet}"
+                  con.execute(
+                      f"""
+                      CREATE VIEW input_incoming AS
+                      SELECT *
+                      FROM read_xlsx(
+                          '{source_file.name}',
+                          sheet = 'Log Incoming',
+                          range = 'A3:F',
+                          all_varchar = true
+                      )
+                      """
                   )
 
-              if list(verified.columns) != columns:
-                  raise RuntimeError(
-                      f"Column verification failed: {sheet}"
+                  con.execute(
+                      f"""
+                      CREATE VIEW input_outgoing AS
+                      SELECT *
+                      FROM read_xlsx(
+                          '{source_file.name}',
+                          sheet = 'Log Outgoing',
+                          range = 'A3:D',
+                          all_varchar = true
+                      )
+                      """
                   )
 
-              if not verified.equals(df):
-                  raise RuntimeError(
-                      f"Data verification failed: {sheet}"
+                  incoming_sql = Path(
+                      "sql/sources/"
+                      "webdav-log-warehouse-incoming.sql"
+                  ).read_text(encoding="utf-8")
+
+                  outgoing_sql = Path(
+                      "sql/sources/"
+                      "webdav-log-warehouse-outgoing.sql"
+                  ).read_text(encoding="utf-8")
+
+                  con.execute(incoming_sql)
+                  con.execute(outgoing_sql)
+
+                  con.execute(
+                      f"""
+                      COPY log_warehouse_incoming
+                      TO '{incoming_output_path}'
+                      (FORMAT PARQUET, COMPRESSION ZSTD)
+                      """
                   )
 
-              parquet_files[sheet] = {
-                  "data": parquet_data,
-                  "rows": len(verified),
-                  "columns": len(verified.columns),
-              }
-
-          # Use one timestamp for all files in this extraction.
-          timestamp = datetime.now(timezone.utc).strftime(
-              "%Y-%m-%d-%H%M%S"
-          )
-
-          object_keys = {
-              "Log Incoming": (
-                  f"{timestamp}-WEBDAV-LOG-WAREHOUSE-INCOMING.parquet"
-              ),
-              "Log Outgoing": (
-                  f"{timestamp}-WEBDAV-LOG-WAREHOUSE-OUTGOING.parquet"
-              ),
-          }
-
-          # Upload both verified Parquet files to R2.
-          s3 = boto3.client(
-              "s3",
-              endpoint_url=(
-                  f"https://{account_id}.r2.cloudflarestorage.com"
-              ),
-              aws_access_key_id=access_key,
-              aws_secret_access_key=secret_key,
-              region_name="auto",
-              config=Config(signature_version="s3v4"),
-          )
-
-          for sheet, result in parquet_files.items():
-              object_key = object_keys[sheet]
-              parquet_data = result["data"]
-
-              s3.put_object(
-                  Bucket=bucket,
-                  Key=object_key,
-                  Body=parquet_data,
-                  ContentType="application/vnd.apache.parquet",
-              )
-
-              uploaded = s3.head_object(
-                  Bucket=bucket,
-                  Key=object_key,
-              )
-
-              if uploaded["ContentLength"] != len(parquet_data):
-                  raise RuntimeError(
-                      f"R2 upload size verification failed: {object_key}"
+                  con.execute(
+                      f"""
+                      COPY log_warehouse_outgoing
+                      TO '{outgoing_output_path}'
+                      (FORMAT PARQUET, COMPRESSION ZSTD)
+                      """
                   )
 
-          print("Fetch, processing, and upload successful")
-          print(f"Source filename: {fetcher.suggested_filename}")
-          print(f"Source bytes: {len(data)}")
+                  print("Fetch and transformation successful")
+                  print(
+                      f"Source filename: "
+                      f"{fetcher.suggested_filename}"
+                  )
+                  print(
+                      "R2 incoming object: "
+                      f"{incoming_output_path}"
+                  )
+                  print(
+                      "R2 outgoing object: "
+                      f"{outgoing_output_path}"
+                  )
 
-          for sheet, result in parquet_files.items():
-              print(f"\nWorksheet: {sheet}")
-              print(f"Rows: {result['rows']}")
-              print(f"Columns: {result['columns']}")
-              print(f"Parquet bytes: {len(result['data'])}")
-              print(f"R2 object: {object_keys[sheet]}")
-              print("R2 upload verification: passed")
-
-          print("\nWorksheets excluded: Dash Incoming, Dash Outgoing, Config")
-          print("Notes retained unchanged")
-          print(f"R2 bucket: {bucket}")
+              finally:
+                  con.close()
           PY
