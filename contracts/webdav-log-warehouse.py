@@ -1,7 +1,6 @@
-from datetime import date
-
 import polars as pl
 
+from contracts.common import excel_compatible_date
 from lakehouse.common import load_latest_snapshot
 
 
@@ -58,44 +57,6 @@ INCOMING_TABLE_NAME = "log_warehouse_incoming"
 OUTGOING_TABLE_NAME = "log_warehouse_outgoing"
 
 
-def _date_value(column: str) -> pl.Expr:
-    value = (
-        pl.col(column)
-        .cast(pl.String, strict=True)
-        .str.strip_chars()
-    )
-
-    parsed_datetime = (
-        value.str.strptime(
-            pl.Datetime,
-            format="%Y-%m-%d %H:%M:%S",
-            strict=False,
-        )
-        .dt.date()
-    )
-
-    parsed_date = value.str.strptime(
-        pl.Date,
-        format="%Y-%m-%d",
-        strict=False,
-    )
-
-    excel_serial = (
-        pl.lit(date(1899, 12, 30))
-        + pl.duration(
-            days=value.cast(pl.Int64, strict=False)
-        )
-    ).cast(pl.Date)
-
-    return pl.coalesce(
-        [
-            parsed_datetime,
-            parsed_date,
-            excel_serial,
-        ]
-    )
-
-
 def _nullable_integer(column: str) -> pl.Expr:
     return (
         pl.col(column)
@@ -124,7 +85,7 @@ def transform_incoming(
     df: pl.DataFrame,
 ) -> pl.DataFrame:
     return df.select(
-        _date_value("Date").alias("transaction_date"),
+        excel_compatible_date("Date").alias("transaction_date"),
 
         _nullable_string("Source").alias("source"),
 
@@ -144,7 +105,7 @@ def transform_outgoing(
     df: pl.DataFrame,
 ) -> pl.DataFrame:
     return df.select(
-        _date_value("Date").alias("transaction_date"),
+        excel_compatible_date("Date").alias("transaction_date"),
 
         _nullable_string("Product Type")
         .alias("product_type"),
