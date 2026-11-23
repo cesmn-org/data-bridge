@@ -2,6 +2,7 @@ name: WebDAV Log Rescue Fetcher
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
