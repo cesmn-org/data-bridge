@@ -12,7 +12,11 @@ from botocore.exceptions import ClientError
 BUCKET = "data-bridge"
 CATALOG_KEY = "lakehouse/catalog.duckdb"
 DATA_PATH = "r2://data-bridge/lakehouse/data/"
+
 OA_DISTRIBUTION_PREFIX = "snapshots/mealconnect-oadist/"
+ANONYMOUS_PROGRAMS_PREFIX = (
+    "snapshots/webdav-log-anonymous-programs/"
+)
 
 
 def r2_client():
@@ -57,8 +61,8 @@ def upload_catalog(s3, catalog_path: Path) -> None:
     )
 
 
-def list_snapshot_keys(s3, prefix: str) -> list[str]:
-    keys = []
+def list_snapshot_objects(s3, prefix: str) -> list[dict]:
+    objects = []
     continuation_token = None
 
     while True:
@@ -73,15 +77,17 @@ def list_snapshot_keys(s3, prefix: str) -> list[str]:
         response = s3.list_objects_v2(**request)
 
         for item in response.get("Contents", []):
-            key = item["Key"]
-
-            if key.endswith(".parquet"):
-                keys.append(key)
+            if item["Key"].endswith(".parquet"):
+                objects.append(item)
 
         if not response.get("IsTruncated"):
-            return sorted(keys)
+            return objects
 
         continuation_token = response["NextContinuationToken"]
+
+
+def r2_uri(key: str) -> str:
+    return f"r2://{BUCKET}/{key}"
 
 
 def configure_r2(con: duckdb.DuckDBPyConnection) -> None:
@@ -94,6 +100,8 @@ def configure_r2(con: duckdb.DuckDBPyConnection) -> None:
 
     con.execute("INSTALL httpfs")
     con.execute("LOAD httpfs")
+    con.execute("INSTALL ducklake")
+    con.execute("LOAD ducklake")
 
     con.execute(
         f"""
@@ -109,16 +117,16 @@ def configure_r2(con: duckdb.DuckDBPyConnection) -> None:
 
 def load_oa_distribution(
     con: duckdb.DuckDBPyConnection,
-    snapshot_keys: list[str],
+    snapshot_objects: list[dict],
 ) -> None:
-    if not snapshot_keys:
+    if not snapshot_objects:
         raise RuntimeError(
             "No OA Distribution snapshots were found"
         )
 
     snapshot_paths = [
-        f"r2://{BUCKET}/{key}"
-        for key in snapshot_keys
+        r2_uri(item["Key"])
+        for item in snapshot_objects
     ]
 
     con.read_parquet(
@@ -158,6 +166,41 @@ def load_oa_distribution(
     )
 
 
+def load_anonymous_programs(
+    con: duckdb.DuckDBPyConnection,
+    snapshot_objects: list[dict],
+) -> None:
+    if not snapshot_objects:
+        raise RuntimeError(
+            "No Anonymous Programs snapshots were found"
+        )
+
+    latest_snapshot = max(
+        snapshot_objects,
+        key=lambda item: item["LastModified"],
+    )
+
+    con.read_parquet(
+        r2_uri(latest_snapshot["Key"])
+    ).create_view("anonymous_programs_snapshot")
+
+    con.execute(
+        """
+        CREATE OR REPLACE TABLE lake.log_anonymous_programs AS
+        SELECT
+            service_date,
+            program,
+            households,
+            children,
+            adults,
+            seniors,
+            pounds,
+            note
+        FROM anonymous_programs_snapshot
+        """
+    )
+
+
 def main() -> None:
     s3 = r2_client()
 
@@ -183,14 +226,24 @@ def main() -> None:
                 """
             )
 
-            oa_distribution_keys = list_snapshot_keys(
+            oa_distribution_objects = list_snapshot_objects(
                 s3,
                 OA_DISTRIBUTION_PREFIX,
             )
 
+            anonymous_programs_objects = list_snapshot_objects(
+                s3,
+                ANONYMOUS_PROGRAMS_PREFIX,
+            )
+
             load_oa_distribution(
                 con,
-                oa_distribution_keys,
+                oa_distribution_objects,
+            )
+
+            load_anonymous_programs(
+                con,
+                anonymous_programs_objects,
             )
 
             con.execute("CHECKPOINT")
@@ -202,7 +255,15 @@ def main() -> None:
 
     print("Lakehouse load successful")
     print("Loaded table: lake.oa_distribution")
-    print(f"OA Distribution snapshots: {len(oa_distribution_keys)}")
+    print("Loaded table: lake.log_anonymous_programs")
+    print(
+        "OA Distribution snapshots: "
+        f"{len(oa_distribution_objects)}"
+    )
+    print(
+        "Anonymous Programs snapshots: "
+        f"{len(anonymous_programs_objects)}"
+    )
 
 
 if __name__ == "__main__":
