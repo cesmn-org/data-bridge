@@ -48,7 +48,6 @@ jobs:
           import duckdb
           from libfetch import OADist
 
-
           expected_columns = [
               "OrderType",
               "OrderLocation",
@@ -110,7 +109,8 @@ jobs:
               output_path = (
                   "s3://data-bridge/"
                   "snapshots/mealconnect-oadist/"
-                  f"{timestamp}-{os.environ['GITHUB_RUN_ID']}.parquet"
+                  f"{timestamp}-"
+                  f"{os.environ['GITHUB_RUN_ID']}.parquet"
               )
 
               con = duckdb.connect()
@@ -130,19 +130,11 @@ jobs:
                       """
                   )
 
-                  con.execute(
-                      """
-                      CREATE VIEW input_data AS
-                      SELECT *
-                      FROM read_csv(
-                          ?,
-                          header = true,
-                          all_varchar = true,
-                          encoding = 'utf-8'
-                      )
-                      """,
-                      [source_file.name],
-                  )
+                  con.read_csv(
+                      source_file.name,
+                      header=True,
+                      all_varchar=True,
+                  ).create_view("input_data")
 
                   sql = Path(
                       "sql/sources/mealconnect-oadist.sql"
@@ -151,12 +143,11 @@ jobs:
                   con.execute(sql)
 
                   con.execute(
-                      """
+                      f"""
                       COPY oa_distribution
-                      TO ?
+                      TO '{output_path}'
                       (FORMAT PARQUET, COMPRESSION ZSTD)
-                      """,
-                      [output_path],
+                      """
                   )
 
                   print("Fetch and transformation successful")
