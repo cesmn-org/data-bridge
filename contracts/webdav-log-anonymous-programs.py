@@ -1,4 +1,3 @@
-
 from datetime import date
 
 import polars as pl
@@ -30,8 +29,21 @@ OUTPUT_SCHEMA = pl.Schema(
 )
 
 
+# Lakehouse loading contract
+
+SNAPSHOT_PREFIX = (
+    "snapshots/webdav-log-anonymous-programs/"
+)
+
+TABLE_NAME = "log_anonymous_programs"
+
+
 def _service_date() -> pl.Expr:
-    value = pl.col("Date").cast(pl.String, strict=True).str.strip_chars()
+    value = (
+        pl.col("Date")
+        .cast(pl.String, strict=True)
+        .str.strip_chars()
+    )
 
     parsed_datetime = value.str.strptime(
         pl.Datetime,
@@ -61,7 +73,9 @@ def _service_date() -> pl.Expr:
     )
 
 
-def _integer_with_blank_as_zero(column: str) -> pl.Expr:
+def _integer_with_blank_as_zero(
+    column: str,
+) -> pl.Expr:
     value = (
         pl.col(column)
         .cast(pl.String, strict=True)
@@ -112,3 +126,71 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         )
         .alias("note"),
     )
+
+
+def load(
+    con,
+    bucket: str,
+    sql_string,
+    require_nonempty_table,
+) -> int:
+    snapshot_glob = (
+        f"r2://{bucket}/"
+        f"{SNAPSHOT_PREFIX}*.parquet"
+    )
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {TABLE_NAME} AS
+        SELECT
+            service_date,
+            program,
+            households,
+            children,
+            adults,
+            seniors,
+            pounds,
+            note
+        FROM (
+            SELECT
+                service_date,
+                program,
+                households,
+                children,
+                adults,
+                seniors,
+                pounds,
+                note,
+                filename,
+                MAX(filename) OVER () AS latest_filename
+            FROM read_parquet(
+                {sql_string(snapshot_glob)},
+                filename = true
+            )
+        )
+        WHERE filename = latest_filename
+        """
+    )
+
+    return require_nonempty_table(
+        con,
+        TABLE_NAME,
+    )
+
+
+def sample(con) -> list[tuple]:
+    return con.execute(
+        f"""
+        SELECT
+            service_date,
+            program,
+            households,
+            children,
+            adults,
+            seniors,
+            pounds
+        FROM {TABLE_NAME}
+        ORDER BY service_date, program
+        LIMIT 5
+        """
+    ).fetchall()
