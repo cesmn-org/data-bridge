@@ -231,12 +231,12 @@ def verify_tables(
             f"SELECT COUNT(*) FROM lake.{table_name}"
         ).fetchone()[0]
 
-        row_counts[table_name] = row_count
-
         if row_count == 0:
             raise RuntimeError(
                 f"DuckLake table is empty: lake.{table_name}"
             )
+
+        row_counts[table_name] = row_count
 
     return row_counts
 
@@ -250,6 +250,8 @@ def main() -> None:
             / "catalog.duckdb"
         )
 
+        # If the catalog was deleted from R2, DuckLake creates a
+        # new catalog at this path.
         download_catalog(s3, catalog_path)
 
         oa_distribution_objects = list_snapshot_objects(
@@ -296,10 +298,12 @@ def main() -> None:
         upload_catalog(s3, catalog_path)
 
     print("Lakehouse load successful")
-    print("Verified tables:")
 
     for table_name, row_count in row_counts.items():
-        print(f"  lake.{table_name}: {row_count} rows")
+        print(
+            f"lake.{table_name}: "
+            f"{row_count} rows"
+        )
 
 
 if __name__ == "__main__":
