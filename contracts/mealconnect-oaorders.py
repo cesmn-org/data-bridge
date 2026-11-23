@@ -138,6 +138,15 @@ BOOLEAN_COLUMNS = [
 ]
 
 
+# Lakehouse loading contract
+
+SNAPSHOT_PREFIX = (
+    "snapshots/mealconnect-oaorders/"
+)
+
+TABLE_NAME = "oa_orders"
+
+
 def _nullable_string(column: str) -> pl.Expr:
     value = (
         pl.col(column)
@@ -232,7 +241,9 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         .alias("household_seniors_count"),
 
         _nullable_string("Gender").alias("gender"),
+
         _nullable_string("Race").alias("race"),
+
         _nullable_string("HowDidYouHear")
         .alias("how_did_you_hear"),
 
@@ -278,8 +289,13 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         .alias("is_food_insecure_per_latest_response"),
 
         _nullable_string("OrderID").alias("order_id"),
-        _nullable_string("OrderNumber").alias("order_number"),
-        _nullable_string("OrderStatus").alias("order_status"),
+
+        _nullable_string("OrderNumber")
+        .alias("order_number"),
+
+        _nullable_string("OrderStatus")
+        .alias("order_status"),
+
         _nullable_string("PlaceOfService")
         .alias("place_of_service"),
 
@@ -299,7 +315,8 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         )
         .alias("birth_date"),
 
-        _nullable_integer("Age").alias("age"),
+        _nullable_integer("Age")
+        .alias("age"),
 
         _boolean("NoFixedAddress")
         .alias("no_fixed_address"),
@@ -352,3 +369,58 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         _nullable_string("FoodAllergies")
         .alias("food_allergies"),
     )
+
+
+def load(
+    con,
+    bucket: str,
+    sql_string,
+    require_nonempty_table,
+) -> int:
+    snapshot_glob = (
+        f"r2://{bucket}/"
+        f"{SNAPSHOT_PREFIX}*.parquet"
+    )
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {TABLE_NAME} AS
+        SELECT * EXCLUDE (filename)
+        FROM read_parquet(
+            {sql_string(snapshot_glob)},
+            filename = true
+        )
+        WHERE filename = (
+            SELECT MAX(filename)
+            FROM read_parquet(
+                {sql_string(snapshot_glob)},
+                filename = true
+            )
+        )
+        """
+    )
+
+    return require_nonempty_table(
+        con,
+        TABLE_NAME,
+    )
+
+
+def sample(con) -> list[tuple]:
+    return con.execute(
+        f"""
+        SELECT
+            client_id,
+            order_id,
+            order_number,
+            order_status,
+            place_of_service,
+            date_of_service,
+            household_size,
+            gender_identity,
+            race_ethnicity
+        FROM {TABLE_NAME}
+        ORDER BY created, order_number
+        LIMIT 5
+        """
+    ).fetchall()
