@@ -1,4 +1,3 @@
-
 name: MealConnect OADist Fetcher
 
 on:
@@ -10,7 +9,6 @@ permissions:
 jobs:
   fetch-oadist:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
 
     steps:
       - name: Check out data-bridge
@@ -24,13 +22,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "git+https://github.com/cesmn-org/libfetch.git"
-          python -m pip install pandas pyarrow boto3
+          python -m pip install \
+            "git+https://github.com/cesmn-org/libfetch.git" \
+            duckdb
 
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Fetch, generate Parquet, and upload to R2
+      - name: Fetch and upload Parquet
         env:
           MEALCONNECT_USERNAME: ${{ secrets.MEALCONNECT_USERNAME }}
           MEALCONNECT_PASSWORD: ${{ secrets.MEALCONNECT_PASSWORD }}
@@ -39,45 +38,15 @@ jobs:
           CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
         run: |
           python - <<'PY'
+          import csv
           import os
-          import io
+          import tempfile
           from datetime import datetime, timezone
+          from pathlib import Path
 
-          import boto3
-          import pandas as pd
-
-          from botocore.config import Config
+          import duckdb
           from libfetch import OADist
 
-          # Configuration
-          username = os.environ["MEALCONNECT_USERNAME"]
-          password = os.environ["MEALCONNECT_PASSWORD"]
-
-          account_id = os.environ["CLOUDFLARE_R2_ACCOUNT_ID"]
-          access_key = os.environ["CLOUDFLARE_R2_ACCESS_KEY_ID"]
-          secret_key = os.environ["CLOUDFLARE_R2_SECRET_ACCESS_KEY"]
-
-          bucket = "data-bridge"
-
-          required_values = {
-              "MEALCONNECT_USERNAME": username,
-              "MEALCONNECT_PASSWORD": password,
-              "CLOUDFLARE_R2_ACCOUNT_ID": account_id,
-              "CLOUDFLARE_R2_ACCESS_KEY_ID": access_key,
-              "CLOUDFLARE_R2_SECRET_ACCESS_KEY": secret_key,
-          }
-
-          missing = [
-              name for name, value in required_values.items()
-              if not value
-          ]
-
-          if missing:
-              raise RuntimeError(
-                  f"Required secrets are missing: {', '.join(missing)}"
-              )
-
-          # Expected report structure.
           expected_columns = [
               "OrderType",
               "OrderLocation",
@@ -90,109 +59,98 @@ jobs:
               "IsTEFAP",
           ]
 
-          # Fetch report.
-          fetcher = OADist(username, password).fetch()
-          data = fetcher.to_bytes()
+          fetcher = OADist(
+              os.environ["MEALCONNECT_USERNAME"],
+              os.environ["MEALCONNECT_PASSWORD"],
+          ).fetch()
 
-          if not data:
-              raise RuntimeError("The downloaded report is empty")
+          source_bytes = fetcher.to_bytes()
 
-          # Read all values as strings to preserve original values.
-          df = pd.read_csv(
-              io.BytesIO(data),
-              dtype=str,
-              keep_default_na=False,
-              encoding="utf-8-sig",
-          )
+          with tempfile.NamedTemporaryFile(suffix=".csv") as source_file:
+              source_file.write(source_bytes)
+              source_file.flush()
 
-          # Check for unexpected changes to the report structure.
-          if list(df.columns) != expected_columns:
-              raise RuntimeError(
-                  "Unexpected report columns: "
-                  f"{list(df.columns)}"
+              with open(
+                  source_file.name,
+                  encoding="utf-8-sig",
+                  newline="",
+              ) as csv_file:
+                  actual_columns = next(csv.reader(csv_file))
+
+              if actual_columns != expected_columns:
+                  raise RuntimeError(
+                      f"Unexpected columns: {actual_columns}"
+                  )
+
+              account_id = os.environ["CLOUDFLARE_R2_ACCOUNT_ID"]
+              access_key = os.environ[
+                  "CLOUDFLARE_R2_ACCESS_KEY_ID"
+              ]
+              secret_key = os.environ[
+                  "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
+              ]
+
+              timestamp = datetime.now(timezone.utc).strftime(
+                  "%Y-%m-%dT%H-%M-%SZ"
               )
 
-          if len(df) == 0:
-              raise RuntimeError("The report contains no data rows")
+              output_path = (
+                  "s3://data-bridge/"
+                  "snapshots/mealconnect-oadist/"
+                  f"{timestamp}.parquet"
+              )
 
-          original_rows = len(df)
+              con = duckdb.connect()
 
-          # Generate Parquet entirely in memory.
-          parquet_buffer = io.BytesIO()
+              con.execute("INSTALL httpfs")
+              con.execute("LOAD httpfs")
 
-          df.to_parquet(
-              parquet_buffer,
-              engine="pyarrow",
-              index=False,
-          )
+              con.execute(
+                  "SET s3_region = ?",
+                  ["auto"],
+              )
+              con.execute(
+                  "SET s3_endpoint = ?",
+                  [f"{account_id}.r2.cloudflarestorage.com"],
+              )
+              con.execute(
+                  "SET s3_access_key_id = ?",
+                  [access_key],
+              )
+              con.execute(
+                  "SET s3_secret_access_key = ?",
+                  [secret_key],
+              )
 
-          parquet_data = parquet_buffer.getvalue()
+              con.execute(
+                  """
+                  CREATE VIEW input_data AS
+                  SELECT *
+                  FROM read_csv(
+                      ?,
+                      header = true,
+                      all_varchar = true
+                  )
+                  """,
+                  [source_file.name],
+              )
 
-          if not parquet_data:
-              raise RuntimeError("Parquet generation produced an empty file")
+              sql = Path(
+                  "sql/sources/mealconnect-oadist.sql"
+              ).read_text(encoding="utf-8")
 
-          # Read Parquet back and verify it.
-          verified = pd.read_parquet(
-              io.BytesIO(parquet_data),
-              engine="pyarrow",
-          )
+              con.execute(sql)
 
-          if len(verified) != original_rows:
-              raise RuntimeError("Parquet row count verification failed")
+              con.execute(
+                  """
+                  COPY oa_distribution
+                  TO ?
+                  (FORMAT PARQUET, COMPRESSION ZSTD)
+                  """,
+                  [output_path],
+              )
 
-          if list(verified.columns) != expected_columns:
-              raise RuntimeError("Parquet column verification failed")
+              con.close()
 
-          if not verified.equals(df):
-              raise RuntimeError("Parquet data verification failed")
-
-          # Generate unique UTC object key.
-          timestamp = datetime.now(timezone.utc).strftime(
-              "%Y-%m-%d-%H%M%S"
-          )
-
-          object_key = (
-              f"{timestamp}-MEALCONNECT-DISTRIBUTION.parquet"
-          )
-
-          # Connect to Cloudflare R2.
-          s3 = boto3.client(
-              "s3",
-              endpoint_url=(
-                  f"https://{account_id}.r2.cloudflarestorage.com"
-              ),
-              aws_access_key_id=access_key,
-              aws_secret_access_key=secret_key,
-              region_name="auto",
-              config=Config(signature_version="s3v4"),
-          )
-
-          # Upload processed Parquet.
-          s3.put_object(
-              Bucket=bucket,
-              Key=object_key,
-              Body=parquet_data,
-              ContentType="application/vnd.apache.parquet",
-          )
-
-          # Verify uploaded object.
-          uploaded = s3.head_object(
-              Bucket=bucket,
-              Key=object_key,
-          )
-
-          if uploaded["ContentLength"] != len(parquet_data):
-              raise RuntimeError("R2 upload size verification failed")
-
-          print("Fetch, Parquet generation, and upload successful")
-          print(f"Source filename: {fetcher.suggested_filename}")
-          print(f"Source bytes: {len(data)}")
-          print(f"Parquet bytes: {len(parquet_data)}")
-          print(f"Rows: {len(verified)}")
-          print(f"Columns: {len(verified.columns)}")
-          print("All 9 columns preserved")
-          print("Parquet read-back verification: passed")
-          print(f"R2 bucket: {bucket}")
-          print(f"R2 object: {object_key}")
-          print("R2 upload verification: passed")
+              print(f"Uploaded {output_path}")
           PY
