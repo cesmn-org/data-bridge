@@ -24,12 +24,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install \
             "git+https://github.com/cesmn-org/libfetch.git" \
-            duckdb
+            duckdb \
+            fsspec
 
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Fetch, transform, and upload Parquet
+      - name: Fetch, validate, transform, and upload Parquet
         env:
           MEALCONNECT_USERNAME: ${{ secrets.MEALCONNECT_USERNAME }}
           MEALCONNECT_PASSWORD: ${{ secrets.MEALCONNECT_PASSWORD }}
@@ -40,8 +41,8 @@ jobs:
         run: |
           python - <<'PY'
           import csv
+          import io
           import os
-          import tempfile
           from datetime import datetime, timezone
           from pathlib import Path
 
@@ -49,18 +50,7 @@ jobs:
           from libfetch import OADist
 
 
-          expected_columns = [
-              "OrderType",
-              "OrderLocation",
-              "Date",
-              "ItemLocation",
-              "ItemName",
-              "Quantity",
-              "UnitPounds",
-              "TotalPounds",
-              "IsTEFAP",
-          ]
-
+          # Fetch the report into memory.
           fetcher = OADist(
               os.environ["MEALCONNECT_USERNAME"],
               os.environ["MEALCONNECT_PASSWORD"],
@@ -71,27 +61,71 @@ jobs:
           if not source_bytes:
               raise RuntimeError("The downloaded report is empty")
 
-          with tempfile.NamedTemporaryFile(
-              mode="wb",
-              suffix=".csv",
-          ) as source_file:
-              source_file.write(source_bytes)
-              source_file.flush()
+          con = duckdb.connect()
 
-              with open(
-                  source_file.name,
+          try:
+              # Define the expected source columns in SQL, then discover them.
+              schema_sql = Path(
+                  "sql/sources/mealconnect-oadist-input.sql"
+              ).read_text(encoding="utf-8")
+
+              con.execute(schema_sql)
+
+              expected_columns = [
+                  row[1]
+                  for row in con.execute(
+                      "PRAGMA table_info('oa_distribution_csv_schema')"
+                  ).fetchall()
+              ]
+
+              # Read the CSV header independently so duplicate names are not
+              # hidden by DuckDB's automatic duplicate-column renaming.
+              header_stream = io.TextIOWrapper(
+                  io.BytesIO(source_bytes),
                   encoding="utf-8-sig",
                   newline="",
-              ) as csv_file:
-                  actual_columns = next(csv.reader(csv_file), None)
+              )
+              actual_columns = next(csv.reader(header_stream), None)
 
-              if actual_columns != expected_columns:
+              if not actual_columns:
+                  raise RuntimeError("The downloaded CSV has no header row")
+
+              if len(actual_columns) != len(set(actual_columns)):
                   raise RuntimeError(
-                      "Unexpected source columns:\n"
-                      f"Expected: {expected_columns}\n"
-                      f"Actual:   {actual_columns}"
+                      "CSV schema validation failed: duplicate column names "
+                      f"found: {actual_columns}"
                   )
 
+              unexpected = sorted(
+                  set(actual_columns) - set(expected_columns)
+              )
+              missing = sorted(
+                  set(expected_columns) - set(actual_columns)
+              )
+
+              if unexpected or missing:
+                  raise RuntimeError(
+                      "CSV schema validation failed:\n"
+                      f"Unexpected columns: {unexpected}\n"
+                      f"Missing columns: {missing}"
+                  )
+
+              # All source values enter DuckDB as VARCHAR. The transformation
+              # SQL is responsible for parsing and casting them.
+              con.read_csv(
+                  io.BytesIO(source_bytes),
+                  header=True,
+                  all_varchar=True,
+              ).create_view("input_data")
+
+              # Transform using the existing SQL.
+              sql = Path(
+                  "sql/sources/mealconnect-oadist.sql"
+              ).read_text(encoding="utf-8")
+
+              con.execute(sql)
+
+              # Configure R2 access and write the resulting Parquet file.
               os.environ["AWS_ACCESS_KEY_ID"] = os.environ[
                   "CLOUDFLARE_R2_ACCESS_KEY_ID"
               ]
@@ -99,9 +133,21 @@ jobs:
                   "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
               ]
 
-              account_id = os.environ[
-                  "CLOUDFLARE_R2_ACCOUNT_ID"
-              ]
+              account_id = os.environ["CLOUDFLARE_R2_ACCOUNT_ID"]
+
+              con.execute("INSTALL httpfs")
+              con.execute("LOAD httpfs")
+
+              con.execute(
+                  f"""
+                  CREATE OR REPLACE SECRET r2_secret (
+                      TYPE R2,
+                      PROVIDER credential_chain,
+                      CHAIN 'env',
+                      ACCOUNT_ID '{account_id}'
+                  )
+                  """
+              )
 
               timestamp = datetime.now(timezone.utc).strftime(
                   "%Y-%m-%dT%H-%M-%SZ"
@@ -114,50 +160,18 @@ jobs:
                   f"{os.environ['GITHUB_RUN_ID']}.parquet"
               )
 
-              con = duckdb.connect()
+              con.execute(
+                  f"""
+                  COPY oa_distribution
+                  TO '{output_path}'
+                  (FORMAT PARQUET, COMPRESSION ZSTD)
+                  """
+              )
 
-              try:
-                  con.execute("INSTALL httpfs")
-                  con.execute("LOAD httpfs")
+              print("Fetch and transformation successful")
+              print(f"Source filename: {fetcher.suggested_filename}")
+              print(f"R2 object: {output_path}")
 
-                  con.execute(
-                      f"""
-                      CREATE OR REPLACE SECRET r2_secret (
-                          TYPE R2,
-                          PROVIDER credential_chain,
-                          CHAIN 'env',
-                          ACCOUNT_ID '{account_id}'
-                      )
-                      """
-                  )
-
-                  con.read_csv(
-                      source_file.name,
-                      header=True,
-                      all_varchar=True,
-                  ).create_view("input_data")
-
-                  sql = Path(
-                      "sql/sources/mealconnect-oadist.sql"
-                  ).read_text(encoding="utf-8")
-
-                  con.execute(sql)
-
-                  con.execute(
-                      f"""
-                      COPY oa_distribution
-                      TO '{output_path}'
-                      (FORMAT PARQUET, COMPRESSION ZSTD)
-                      """
-                  )
-
-                  print("Fetch and transformation successful")
-                  print(
-                      f"Source filename: "
-                      f"{fetcher.suggested_filename}"
-                  )
-                  print(f"R2 object: {output_path}")
-
-              finally:
-                  con.close()
+          finally:
+              con.close()
           PY
