@@ -3,15 +3,21 @@ import os
 
 BUCKET = "data-bridge"
 SNAPSHOT_PREFIX = "snapshots/"
+
 OA_DISTRIBUTION_PREFIX = (
     "snapshots/mealconnect-oadist/"
 )
 ANONYMOUS_PROGRAMS_PREFIX = (
     "snapshots/webdav-log-anonymous-programs/"
 )
+RESCUE_PREFIX = (
+    "snapshots/webdav-log-rescue/"
+)
 
 OA_DISTRIBUTION_TABLE = "oa_distribution"
 ANONYMOUS_PROGRAMS_TABLE = "log_anonymous_programs"
+RESCUE_TABLE = "log_rescue"
+
 R2_SECRET_NAME = "data_bridge_r2"
 
 
@@ -29,11 +35,6 @@ def required_environment(name: str) -> str:
 def sql_string(value: str) -> str:
     """Quote a value for use as a SQL string literal."""
     return "'" + value.replace("'", "''") + "'"
-
-
-def sql_identifier(value: str) -> str:
-    """Quote a value for use as a SQL identifier."""
-    return '"' + value.replace('"', '""') + '"'
 
 
 def connect_to_motherduck():
@@ -84,7 +85,7 @@ def select_ducklake_database(con) -> str:
     )
 
     con.execute(
-        f"USE {sql_identifier(database_name)}"
+        f'USE "{database_name.replace(chr(34), chr(34) * 2)}"'
     )
 
     return database_name
@@ -209,6 +210,65 @@ def load_anonymous_programs(con) -> int:
     return row_count
 
 
+def load_rescue(con) -> int:
+    snapshot_glob = (
+        f"r2://{BUCKET}/"
+        f"{RESCUE_PREFIX}*.parquet"
+    )
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {RESCUE_TABLE} AS
+        SELECT
+            rescue_date,
+            location,
+            bakery,
+            dairy,
+            deli,
+            dry,
+            frozen,
+            nonfood,
+            produce,
+            total
+        FROM (
+            SELECT
+                rescue_date,
+                location,
+                bakery,
+                dairy,
+                deli,
+                dry,
+                frozen,
+                nonfood,
+                produce,
+                total,
+                filename,
+                MAX(filename) OVER () AS latest_filename
+            FROM read_parquet(
+                {sql_string(snapshot_glob)},
+                filename = true
+            )
+        )
+        WHERE filename = latest_filename
+        """
+    )
+
+    row_count = con.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM {RESCUE_TABLE}
+        """
+    ).fetchone()[0]
+
+    if row_count == 0:
+        raise RuntimeError(
+            "MotherDuck table is empty: "
+            f"{RESCUE_TABLE}"
+        )
+
+    return row_count
+
+
 def main() -> None:
     con = connect_to_motherduck()
 
@@ -223,6 +283,8 @@ def main() -> None:
         anonymous_programs_row_count = (
             load_anonymous_programs(con)
         )
+
+        rescue_row_count = load_rescue(con)
 
         oa_distribution_sample = con.execute(
             f"""
@@ -255,32 +317,50 @@ def main() -> None:
             """
         ).fetchall()
 
+        rescue_sample = con.execute(
+            f"""
+            SELECT
+                rescue_date,
+                location,
+                bakery,
+                dairy,
+                deli,
+                dry,
+                frozen,
+                nonfood,
+                produce,
+                total
+            FROM {RESCUE_TABLE}
+            ORDER BY rescue_date, location
+            LIMIT 5
+            """
+        ).fetchall()
+
     finally:
         con.close()
 
     print("MotherDuck DuckLake load successful")
     print(f"Database: {database_name}")
 
-    print(
-        f"Table: {OA_DISTRIBUTION_TABLE}"
-    )
-    print(
-        f"Rows: {oa_distribution_row_count}"
-    )
+    print(f"Table: {OA_DISTRIBUTION_TABLE}")
+    print(f"Rows: {oa_distribution_row_count}")
     print("Sample rows:")
 
     for row in oa_distribution_sample:
         print(row)
 
-    print(
-        f"Table: {ANONYMOUS_PROGRAMS_TABLE}"
-    )
-    print(
-        f"Rows: {anonymous_programs_row_count}"
-    )
+    print(f"Table: {ANONYMOUS_PROGRAMS_TABLE}")
+    print(f"Rows: {anonymous_programs_row_count}")
     print("Sample rows:")
 
     for row in anonymous_programs_sample:
+        print(row)
+
+    print(f"Table: {RESCUE_TABLE}")
+    print(f"Rows: {rescue_row_count}")
+    print("Sample rows:")
+
+    for row in rescue_sample:
         print(row)
 
 
