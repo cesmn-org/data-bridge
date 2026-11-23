@@ -1,6 +1,10 @@
 import polars as pl
 
-from contracts.common import excel_compatible_date
+from contracts.common import (
+    excel_compatible_date,
+    nullable_integer,
+    nullable_string,
+)
 from lakehouse.common import load_latest_snapshot
 
 
@@ -57,47 +61,23 @@ INCOMING_TABLE_NAME = "log_warehouse_incoming"
 OUTGOING_TABLE_NAME = "log_warehouse_outgoing"
 
 
-def _nullable_integer(column: str) -> pl.Expr:
-    return (
-        pl.col(column)
-        .cast(pl.String, strict=True)
-        .str.strip_chars()
-        .replace("", None)
-        .cast(pl.Int64, strict=True)
-    )
-
-
-def _nullable_string(column: str) -> pl.Expr:
-    value = (
-        pl.col(column)
-        .cast(pl.String, strict=True)
-        .str.strip_chars()
-    )
-
-    return (
-        pl.when(value == "")
-        .then(pl.lit(None, dtype=pl.String))
-        .otherwise(value)
-    )
-
-
 def transform_incoming(
     df: pl.DataFrame,
 ) -> pl.DataFrame:
     return df.select(
         excel_compatible_date("Date").alias("transaction_date"),
 
-        _nullable_string("Source").alias("source"),
+        nullable_string("Source").alias("source"),
 
-        _nullable_string("Transaction Type")
+        nullable_string("Transaction Type")
         .alias("transaction_type"),
 
-        _nullable_string("Product Type")
+        nullable_string("Product Type")
         .alias("product_type"),
 
-        _nullable_integer("Pounds").alias("pounds"),
+        nullable_integer("Pounds").alias("pounds"),
 
-        _nullable_string("Note").alias("note"),
+        nullable_string("Note").alias("note"),
     )
 
 
@@ -107,12 +87,12 @@ def transform_outgoing(
     return df.select(
         excel_compatible_date("Date").alias("transaction_date"),
 
-        _nullable_string("Product Type")
+        nullable_string("Product Type")
         .alias("product_type"),
 
-        _nullable_integer("Pounds").alias("pounds"),
+        nullable_integer("Pounds").alias("pounds"),
 
-        _nullable_string("Note").alias("note"),
+        nullable_string("Note").alias("note"),
     )
 
 

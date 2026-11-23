@@ -5,6 +5,37 @@ from datetime import date
 import polars as pl
 
 
+def nullable_string(
+    column: str,
+    *,
+    strict: bool = True,
+) -> pl.Expr:
+    """Trim strings and convert blanks and nulls to null."""
+    value = (
+        pl.col(column)
+        .cast(pl.String, strict=strict)
+        .str.strip_chars()
+    )
+
+    return (
+        pl.when(value.is_null() | (value == ""))
+        .then(pl.lit(None, dtype=pl.String))
+        .otherwise(value)
+    )
+
+
+def nullable_integer(
+    column: str,
+    *,
+    strict: bool = True,
+) -> pl.Expr:
+    """Convert trimmed strings, blanks, and nulls to nullable integers."""
+    return nullable_string(column, strict=strict).cast(
+        pl.Int64,
+        strict=True,
+    )
+
+
 def excel_compatible_date(column: str) -> pl.Expr:
     """Parse ISO dates, ISO datetimes, or Excel serial dates."""
     value = (

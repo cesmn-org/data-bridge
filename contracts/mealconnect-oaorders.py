@@ -1,5 +1,6 @@
 import polars as pl
 
+from contracts.common import nullable_integer, nullable_string
 from lakehouse.common import load_latest_snapshot
 
 
@@ -149,27 +150,6 @@ SNAPSHOT_PREFIX = (
 TABLE_NAME = "oa_orders"
 
 
-def _nullable_string(column: str) -> pl.Expr:
-    value = (
-        pl.col(column)
-        .cast(pl.String, strict=False)
-        .str.strip_chars()
-    )
-
-    return (
-        pl.when(value.is_null() | (value == ""))
-        .then(pl.lit(None, dtype=pl.String))
-        .otherwise(value)
-    )
-
-
-def _nullable_integer(column: str) -> pl.Expr:
-    return _nullable_string(column).cast(
-        pl.Int64,
-        strict=True,
-    )
-
-
 def _boolean(column: str) -> pl.Expr:
     value = (
         pl.col(column)
@@ -219,7 +199,7 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
     _validate_boolean_values(df)
 
     return df.select(
-        _nullable_string("ID").alias("client_id"),
+        nullable_string("ID").alias("client_id"),
 
         _boolean("EmailContactApproved")
         .alias("email_contact_approved"),
@@ -230,23 +210,23 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         _boolean("PhoneCallContactApproved")
         .alias("phone_call_contact_approved"),
 
-        _nullable_integer("HouseholdSize")
+        nullable_integer("HouseholdSize")
         .alias("household_size"),
 
-        _nullable_integer("HouseholdAdultsCount")
+        nullable_integer("HouseholdAdultsCount")
         .alias("household_adults_count"),
 
-        _nullable_integer("HouseholdChildrenCount")
+        nullable_integer("HouseholdChildrenCount")
         .alias("household_children_count"),
 
-        _nullable_integer("HouseholdSeniorsCount")
+        nullable_integer("HouseholdSeniorsCount")
         .alias("household_seniors_count"),
 
-        _nullable_string("Gender").alias("gender"),
+        nullable_string("Gender").alias("gender"),
 
-        _nullable_string("Race").alias("race"),
+        nullable_string("Race").alias("race"),
 
-        _nullable_string("HowDidYouHear")
+        nullable_string("HowDidYouHear")
         .alias("how_did_you_hear"),
 
         _boolean("IsParticipationSNAPNoted")
@@ -272,33 +252,33 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         )
         .alias("created"),
 
-        _nullable_integer("TotalOrderCount")
+        nullable_integer("TotalOrderCount")
         .alias("total_order_count"),
 
-        _nullable_integer("CancelledOrderCount")
+        nullable_integer("CancelledOrderCount")
         .alias("cancelled_order_count"),
 
-        _nullable_string("PrimaryDeliveryAddressCity")
+        nullable_string("PrimaryDeliveryAddressCity")
         .alias("primary_delivery_address_city"),
 
-        _nullable_string("PrimaryDeliveryAddressState")
+        nullable_string("PrimaryDeliveryAddressState")
         .alias("primary_delivery_address_state"),
 
-        _nullable_string("PrimaryDeliveryAddressZip")
+        nullable_string("PrimaryDeliveryAddressZip")
         .alias("primary_delivery_address_zip"),
 
         _boolean("IsFoodInsecurePerLatestResponse")
         .alias("is_food_insecure_per_latest_response"),
 
-        _nullable_string("OrderID").alias("order_id"),
+        nullable_string("OrderID").alias("order_id"),
 
-        _nullable_string("OrderNumber")
+        nullable_string("OrderNumber")
         .alias("order_number"),
 
-        _nullable_string("OrderStatus")
+        nullable_string("OrderStatus")
         .alias("order_status"),
 
-        _nullable_string("PlaceOfService")
+        nullable_string("PlaceOfService")
         .alias("place_of_service"),
 
         pl.col("DateOfService")
@@ -317,7 +297,7 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         )
         .alias("birth_date"),
 
-        _nullable_integer("Age")
+        nullable_integer("Age")
         .alias("age"),
 
         _boolean("NoFixedAddress")
@@ -326,49 +306,49 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         _boolean("OkToContact")
         .alias("ok_to_contact"),
 
-        _nullable_string("PreferredContactMethod")
+        nullable_string("PreferredContactMethod")
         .alias("preferred_contact_method"),
 
-        _nullable_string("GenderIdentity")
+        nullable_string("GenderIdentity")
         .alias("gender_identity"),
 
-        _nullable_string("RaceEthnicity")
+        nullable_string("RaceEthnicity")
         .alias("race_ethnicity"),
 
-        _nullable_integer("ProxyCount")
+        nullable_integer("ProxyCount")
         .alias("proxy_count"),
 
-        _nullable_string("OtherGovtPrograms")
+        nullable_string("OtherGovtPrograms")
         .alias("other_govt_programs"),
 
-        _nullable_string("PreferredLanguage")
+        nullable_string("PreferredLanguage")
         .alias("preferred_language"),
 
-        _nullable_string("DisabilityStatus")
+        nullable_string("DisabilityStatus")
         .alias("disability_status"),
 
-        _nullable_string("HouseholdMonthlyIncome")
+        nullable_string("HouseholdMonthlyIncome")
         .alias("household_monthly_income"),
 
-        _nullable_string("LivingSituation")
+        nullable_string("LivingSituation")
         .alias("living_situation"),
 
-        _nullable_string("EmploymentStatus")
+        nullable_string("EmploymentStatus")
         .alias("employment_status"),
 
-        _nullable_string("MilitaryStatus")
+        nullable_string("MilitaryStatus")
         .alias("military_status"),
 
-        _nullable_string("FoodInsecurityWorried")
+        nullable_string("FoodInsecurityWorried")
         .alias("food_insecurity_worried"),
 
-        _nullable_string("FoodInsecurityExperienced")
+        nullable_string("FoodInsecurityExperienced")
         .alias("food_insecurity_experienced"),
 
-        _nullable_string("DietaryRestrictions")
+        nullable_string("DietaryRestrictions")
         .alias("dietary_restrictions"),
 
-        _nullable_string("FoodAllergies")
+        nullable_string("FoodAllergies")
         .alias("food_allergies"),
     )
 

@@ -1,5 +1,6 @@
 import polars as pl
 
+from contracts.common import nullable_string
 from lakehouse.common import load_latest_snapshot
 
 
@@ -60,20 +61,6 @@ SNAPSHOT_PREFIX = (
 TABLE_NAME = "click_n_collect_orders"
 
 
-def _nullable_string(column: str) -> pl.Expr:
-    value = (
-        pl.col(column)
-        .cast(pl.String, strict=True)
-        .str.strip_chars()
-    )
-
-    return (
-        pl.when(value == "")
-        .then(pl.lit(None, dtype=pl.String))
-        .otherwise(value)
-    )
-
-
 def _nullable_datetime(column: str) -> pl.Expr:
     value = (
         pl.col(column)
@@ -94,28 +81,28 @@ def _nullable_datetime(column: str) -> pl.Expr:
 
 def transform(df: pl.DataFrame) -> pl.DataFrame:
     return df.select(
-        _nullable_string("Location")
+        nullable_string("Location")
         .alias("location"),
 
-        _nullable_string("Locker Terminal")
+        nullable_string("Locker Terminal")
         .alias("locker_terminal"),
 
-        _nullable_string("Order ID")
+        nullable_string("Order ID")
         .alias("order_id"),
 
-        _nullable_string("Tracking ID")
+        nullable_string("Tracking ID")
         .alias("tracking_id"),
 
-        _nullable_string("Locker Number")
+        nullable_string("Locker Number")
         .alias("locker_number"),
 
-        _nullable_string("City")
+        nullable_string("City")
         .alias("city"),
 
-        _nullable_string("Country")
+        nullable_string("Country")
         .alias("country"),
 
-        _nullable_string("Post Code")
+        nullable_string("Post Code")
         .alias("post_code"),
 
         pl.col("Date")
@@ -128,13 +115,13 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         )
         .alias("order_date"),
 
-        _nullable_string("Locker Status")
+        nullable_string("Locker Status")
         .alias("locker_status"),
 
-        _nullable_string("Courier")
+        nullable_string("Courier")
         .alias("courier"),
 
-        _nullable_string("Delivery Agency")
+        nullable_string("Delivery Agency")
         .alias("delivery_agency"),
 
         _nullable_datetime("Delivery Date")
