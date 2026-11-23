@@ -1,5 +1,4 @@
-
-name: Click & Collect Orders Fetcher
+name: Click N Collect Orders Fetcher
 
 on:
   workflow_dispatch:
@@ -10,7 +9,6 @@ permissions:
 jobs:
   fetch-cnc-orders:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
 
     steps:
       - name: Check out data-bridge
@@ -24,170 +22,161 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "git+https://github.com/cesmn-org/libfetch.git"
-          python -m pip install pandas pyarrow boto3 openpyxl
+          python -m pip install \
+            "git+https://github.com/cesmn-org/libfetch.git" \
+            polars \
+            fastexcel \
+            boto3
 
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Fetch, process, generate Parquet, and upload to R2
+      - name: Fetch, transform, and upload Parquet
         env:
           CNC_USERNAME: ${{ secrets.CNC_USERNAME }}
           CNC_PASSWORD: ${{ secrets.CNC_PASSWORD }}
           CLOUDFLARE_R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
           CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
           CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           python - <<'PY'
-          import os
           import io
+          import os
           from datetime import datetime, timezone
+          from importlib.util import module_from_spec
+          from importlib.util import spec_from_file_location
+          from pathlib import Path
 
           import boto3
-          import pandas as pd
+          import polars as pl
 
           from botocore.config import Config
           from libfetch import CNCOrders
 
-          username = os.environ["CNC_USERNAME"]
-          password = os.environ["CNC_PASSWORD"]
 
-          account_id = os.environ["CLOUDFLARE_R2_ACCOUNT_ID"]
-          access_key = os.environ["CLOUDFLARE_R2_ACCESS_KEY_ID"]
-          secret_key = os.environ["CLOUDFLARE_R2_SECRET_ACCESS_KEY"]
-
-          bucket = "data-bridge"
-
-          required_values = {
-              "CNC_USERNAME": username,
-              "CNC_PASSWORD": password,
-              "CLOUDFLARE_R2_ACCOUNT_ID": account_id,
-              "CLOUDFLARE_R2_ACCESS_KEY_ID": access_key,
-              "CLOUDFLARE_R2_SECRET_ACCESS_KEY": secret_key,
-          }
-
-          missing = [
-              name for name, value in required_values.items()
-              if not value
-          ]
-
-          if missing:
-              raise RuntimeError(
-                  f"Required secrets are missing: {', '.join(missing)}"
-              )
-
-          expected_columns = [
-              "Location",
-              "Locker Terminal",
-              "Order ID",
-              "Tracking ID",
-              "Locker Number",
-              "First Name",
-              "Last Name",
-              "Mobile",
-              "Email",
-              "Address 1",
-              "Address 2",
-              "City",
-              "Country",
-              "Post Code",
-              "Date",
-              "Locker Status",
-              "Courier",
-              "Delivery Agency",
-              "Delivery Date",
-              "Pick Up Date",
-          ]
-
-          remove_columns = {
-              "First Name",
-              "Last Name",
-              "Mobile",
-              "Email",
-              "Address 1",
-              "Address 2",
-          }
-
-          # Fetch the Excel report.
-          fetcher = CNCOrders(username, password).fetch()
-          data = fetcher.to_bytes()
-
-          if not data:
-              raise RuntimeError("The downloaded report is empty")
-
-          df = pd.read_excel(
-              io.BytesIO(data),
-              dtype=str,
-              keep_default_na=False,
+          contract_path = Path(
+              "contracts/clickncollect-orders.py"
           )
 
-          if list(df.columns) != expected_columns:
+          spec = spec_from_file_location(
+              "clickncollect_orders_contract",
+              contract_path,
+          )
+
+          if spec is None or spec.loader is None:
               raise RuntimeError(
-                  "Unexpected report columns: "
-                  f"{list(df.columns)}"
+                  f"Could not load contract: {contract_path}"
               )
 
-          original_rows = len(df)
+          contract = module_from_spec(spec)
+          spec.loader.exec_module(contract)
 
-          if original_rows == 0:
-              raise RuntimeError("The report contains no data rows")
+          fetcher = CNCOrders(
+              os.environ["CNC_USERNAME"],
+              os.environ["CNC_PASSWORD"],
+          ).fetch()
 
-          missing_columns = remove_columns - set(df.columns)
+          source_bytes = fetcher.to_bytes()
 
-          if missing_columns:
+          if not source_bytes:
+              raise RuntimeError("The downloaded workbook is empty")
+
+          raw = pl.read_excel(
+              io.BytesIO(source_bytes),
+              sheet_name="Sheet1",
+              engine="calamine",
+              schema_overrides={
+                  column: pl.String
+                  for column in contract.RAW_COLUMNS
+              },
+          )
+
+          actual_columns = raw.columns
+          expected_columns = contract.RAW_COLUMNS
+
+          if len(actual_columns) != len(set(actual_columns)):
+              duplicates = sorted(
+                  column
+                  for column in set(actual_columns)
+                  if actual_columns.count(column) > 1
+              )
               raise RuntimeError(
-                  "Expected identifier columns are missing: "
-                  f"{sorted(missing_columns)}"
+                  "Duplicate source columns: "
+                  f"{duplicates}"
               )
 
-          # Remove only the six specified direct identifiers.
-          df = df.drop(columns=list(remove_columns))
+          missing_columns = sorted(
+              set(expected_columns) - set(actual_columns)
+          )
 
-          if len(df) != original_rows:
-              raise RuntimeError("Row count changed during processing")
+          unexpected_columns = sorted(
+              set(actual_columns) - set(expected_columns)
+          )
 
-          if any(column in df.columns for column in remove_columns):
-              raise RuntimeError("Direct identifiers remain in output")
+          if missing_columns or unexpected_columns:
+              raise RuntimeError(
+                  "Click N Collect source schema mismatch.\n"
+                  f"Missing columns: {missing_columns}\n"
+                  f"Unexpected columns: {unexpected_columns}"
+              )
 
-          # Generate Parquet in memory.
+          if actual_columns != expected_columns:
+              raise RuntimeError(
+                  "Click N Collect source columns are in an "
+                  "unexpected order"
+              )
+
+          output = contract.transform(raw)
+
+          if output.schema != contract.OUTPUT_SCHEMA:
+              raise RuntimeError(
+                  "Unexpected canonical output schema.\n"
+                  f"Expected: {contract.OUTPUT_SCHEMA}\n"
+                  f"Actual: {output.schema}"
+              )
+
+          if output.height == 0:
+              raise RuntimeError(
+                  "The transformed workbook contains no rows"
+              )
+
           parquet_buffer = io.BytesIO()
 
-          df.to_parquet(
+          output.write_parquet(
               parquet_buffer,
-              engine="pyarrow",
-              index=False,
+              compression="zstd",
           )
 
           parquet_data = parquet_buffer.getvalue()
 
           if not parquet_data:
-              raise RuntimeError("Parquet generation produced an empty file")
+              raise RuntimeError(
+                  "Parquet generation produced an empty file"
+              )
 
-          # Verify generated Parquet.
-          verified = pd.read_parquet(
-              io.BytesIO(parquet_data),
-              engine="pyarrow",
-          )
+          account_id = os.environ[
+              "CLOUDFLARE_R2_ACCOUNT_ID"
+          ]
 
-          if len(verified) != original_rows:
-              raise RuntimeError("Parquet row count verification failed")
+          access_key = os.environ[
+              "CLOUDFLARE_R2_ACCESS_KEY_ID"
+          ]
 
-          if list(verified.columns) != list(df.columns):
-              raise RuntimeError("Parquet column verification failed")
+          secret_key = os.environ[
+              "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
+          ]
 
-          if not verified.equals(df):
-              raise RuntimeError("Parquet data verification failed")
-
-          # Create a unique snapshot filename.
           timestamp = datetime.now(timezone.utc).strftime(
-              "%Y-%m-%d-%H%M%S"
+              "%Y-%m-%dT%H-%M-%SZ"
           )
 
           object_key = (
-              f"{timestamp}-CLICKNCOLLECT-ORDERS.parquet"
+              "snapshots/clickncollect-orders/"
+              f"{timestamp}-"
+              f"{os.environ['GITHUB_RUN_ID']}.parquet"
           )
 
-          # Upload to R2.
           s3 = boto3.client(
               "s3",
               endpoint_url=(
@@ -200,30 +189,15 @@ jobs:
           )
 
           s3.put_object(
-              Bucket=bucket,
+              Bucket="data-bridge",
               Key=object_key,
               Body=parquet_data,
               ContentType="application/vnd.apache.parquet",
           )
 
-          # Verify uploaded object size.
-          uploaded = s3.head_object(
-              Bucket=bucket,
-              Key=object_key,
-          )
-
-          if uploaded["ContentLength"] != len(parquet_data):
-              raise RuntimeError("R2 upload size verification failed")
-
-          print("Fetch, processing, and upload successful")
+          print("Fetch and transformation successful")
           print(f"Source filename: {fetcher.suggested_filename}")
-          print(f"Source bytes: {len(data)}")
-          print(f"Parquet bytes: {len(parquet_data)}")
-          print(f"Rows: {len(verified)}")
-          print(f"Columns: {len(verified.columns)}")
-          print("Direct identifiers removed: 6")
-          print("City, Country, and Post Code retained")
-          print(f"R2 bucket: {bucket}")
-          print(f"R2 object: {object_key}")
-          print("R2 upload verification: passed")
+          print(f"Rows: {output.height}")
+          print(f"R2 object: s3://data-bridge/{object_key}")
+          print("Output schema verification: passed")
           PY
