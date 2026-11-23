@@ -87,7 +87,13 @@ jobs:
               io.BytesIO(source_bytes),
               sheet_name="Log Anonymous Programs",
               engine="calamine",
-              read_options={"skip_rows": 2},
+              read_options={
+                  "header_row": 2,
+              },
+              schema_overrides={
+                  column: pl.String
+                  for column in raw_columns
+              },
           )
 
           actual_columns = raw.columns
