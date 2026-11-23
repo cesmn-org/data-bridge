@@ -24,7 +24,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install \
             "git+https://github.com/cesmn-org/libfetch.git" \
-            duckdb
+            polars \
+            fastexcel \
+            boto3
 
       - name: Fetch, transform, and upload Parquet
         env:
@@ -36,31 +38,36 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           python - <<'PY'
-          import csv
+          import io
           import os
-          import tempfile
           from datetime import datetime, timezone
+          from importlib.util import module_from_spec
+          from importlib.util import spec_from_file_location
           from pathlib import Path
 
-          import duckdb
+          import boto3
+          import polars as pl
+
+          from botocore.config import Config
           from libfetch import LogWarehouse
 
 
-          expected_incoming_columns = [
-              "Date",
-              "Source",
-              "Transaction Type",
-              "Product Type",
-              "Pounds",
-              "Note",
-          ]
+          contract_path = Path(
+              "contracts/webdav-log-warehouse.py"
+          )
 
-          expected_outgoing_columns = [
-              "Date",
-              "Product Type",
-              "Pounds",
-              "Note",
-          ]
+          spec = spec_from_file_location(
+              "webdav_log_warehouse_contract",
+              contract_path,
+          )
+
+          if spec is None or spec.loader is None:
+              raise RuntimeError(
+                  f"Could not load contract: {contract_path}"
+              )
+
+          contract = module_from_spec(spec)
+          spec.loader.exec_module(contract)
 
           fetcher = LogWarehouse(
               os.environ["WEBDAV_USERNAME"],
@@ -72,134 +79,206 @@ jobs:
           if not source_bytes:
               raise RuntimeError("The downloaded workbook is empty")
 
-          with tempfile.NamedTemporaryFile(
-              mode="wb",
-              suffix=".xlsx",
-          ) as source_file:
-              source_file.write(source_bytes)
-              source_file.flush()
+          schema_overrides = {
+              column: pl.String
+              for column in (
+                  contract.RAW_INCOMING_COLUMNS
+                  + contract.RAW_OUTGOING_COLUMNS
+              )
+          }
 
-              account_id = os.environ[
-                  "CLOUDFLARE_R2_ACCOUNT_ID"
-              ]
+          incoming_raw = pl.read_excel(
+              io.BytesIO(source_bytes),
+              sheet_name="Log Incoming",
+              engine="calamine",
+              read_options={
+                  "header_row": 2,
+              },
+              schema_overrides={
+                  column: pl.String
+                  for column in contract.RAW_INCOMING_COLUMNS
+              },
+          )
 
-              access_key = os.environ[
-                  "CLOUDFLARE_R2_ACCESS_KEY_ID"
-              ]
+          outgoing_raw = pl.read_excel(
+              io.BytesIO(source_bytes),
+              sheet_name="Log Outgoing",
+              engine="calamine",
+              read_options={
+                  "header_row": 2,
+              },
+              schema_overrides={
+                  column: pl.String
+                  for column in contract.RAW_OUTGOING_COLUMNS
+              },
+          )
 
-              secret_key = os.environ[
-                  "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
-              ]
+          def validate_columns(
+              actual_columns: list[str],
+              expected_columns: list[str],
+              dataset_name: str,
+          ) -> None:
+              if len(actual_columns) != len(set(actual_columns)):
+                  duplicates = sorted(
+                      column
+                      for column in set(actual_columns)
+                      if actual_columns.count(column) > 1
+                  )
+                  raise RuntimeError(
+                      f"Duplicate {dataset_name} source columns: "
+                      f"{duplicates}"
+                  )
 
-              os.environ["AWS_ACCESS_KEY_ID"] = access_key
-              os.environ["AWS_SECRET_ACCESS_KEY"] = secret_key
-
-              timestamp = datetime.now(timezone.utc).strftime(
-                  "%Y-%m-%dT%H-%M-%SZ"
+              missing_columns = sorted(
+                  set(expected_columns) - set(actual_columns)
               )
 
-              run_id = os.environ["GITHUB_RUN_ID"]
-
-              incoming_output_path = (
-                  "r2://data-bridge/"
-                  "snapshots/webdav-log-warehouse-incoming/"
-                  f"{timestamp}-{run_id}.parquet"
+              unexpected_columns = sorted(
+                  set(actual_columns) - set(expected_columns)
               )
 
-              outgoing_output_path = (
-                  "r2://data-bridge/"
-                  "snapshots/webdav-log-warehouse-outgoing/"
-                  f"{timestamp}-{run_id}.parquet"
+              if missing_columns or unexpected_columns:
+                  raise RuntimeError(
+                      f"{dataset_name} source schema mismatch.\n"
+                      f"Missing columns: {missing_columns}\n"
+                      f"Unexpected columns: {unexpected_columns}"
+                  )
+
+              if actual_columns != expected_columns:
+                  raise RuntimeError(
+                      f"{dataset_name} source columns are in an "
+                      "unexpected order"
+                  )
+
+          validate_columns(
+              incoming_raw.columns,
+              contract.RAW_INCOMING_COLUMNS,
+              "Warehouse Incoming",
+          )
+
+          validate_columns(
+              outgoing_raw.columns,
+              contract.RAW_OUTGOING_COLUMNS,
+              "Warehouse Outgoing",
+          )
+
+          incoming = contract.transform_incoming(incoming_raw)
+          outgoing = contract.transform_outgoing(outgoing_raw)
+
+          if incoming.schema != contract.INCOMING_OUTPUT_SCHEMA:
+              raise RuntimeError(
+                  "Unexpected Warehouse Incoming output schema.\n"
+                  f"Expected: {contract.INCOMING_OUTPUT_SCHEMA}\n"
+                  f"Actual: {incoming.schema}"
               )
 
-              con = duckdb.connect()
+          if outgoing.schema != contract.OUTGOING_OUTPUT_SCHEMA:
+              raise RuntimeError(
+                  "Unexpected Warehouse Outgoing output schema.\n"
+                  f"Expected: {contract.OUTGOING_OUTPUT_SCHEMA}\n"
+                  f"Actual: {outgoing.schema}"
+              )
 
-              try:
-                  con.execute("INSTALL excel")
-                  con.execute("LOAD excel")
-                  con.execute("INSTALL httpfs")
-                  con.execute("LOAD httpfs")
+          if incoming.height == 0:
+              raise RuntimeError(
+                  "Warehouse Incoming contains no rows"
+              )
 
-                  con.execute(
-                      f"""
-                      CREATE OR REPLACE SECRET r2_secret (
-                          TYPE R2,
-                          PROVIDER credential_chain,
-                          CHAIN 'env',
-                          ACCOUNT_ID '{account_id}'
-                      )
-                      """
-                  )
+          if outgoing.height == 0:
+              raise RuntimeError(
+                  "Warehouse Outgoing contains no rows"
+              )
 
-                  con.execute(
-                      f"""
-                      CREATE VIEW input_incoming AS
-                      SELECT *
-                      FROM read_xlsx(
-                          '{source_file.name}',
-                          sheet = 'Log Incoming',
-                          range = 'A3:F',
-                          all_varchar = true
-                      )
-                      """
-                  )
+          incoming_buffer = io.BytesIO()
+          outgoing_buffer = io.BytesIO()
 
-                  con.execute(
-                      f"""
-                      CREATE VIEW input_outgoing AS
-                      SELECT *
-                      FROM read_xlsx(
-                          '{source_file.name}',
-                          sheet = 'Log Outgoing',
-                          range = 'A3:D',
-                          all_varchar = true
-                      )
-                      """
-                  )
+          incoming.write_parquet(
+              incoming_buffer,
+              compression="zstd",
+          )
 
-                  incoming_sql = Path(
-                      "sql/sources/"
-                      "webdav-log-warehouse-incoming.sql"
-                  ).read_text(encoding="utf-8")
+          outgoing.write_parquet(
+              outgoing_buffer,
+              compression="zstd",
+          )
 
-                  outgoing_sql = Path(
-                      "sql/sources/"
-                      "webdav-log-warehouse-outgoing.sql"
-                  ).read_text(encoding="utf-8")
+          incoming_data = incoming_buffer.getvalue()
+          outgoing_data = outgoing_buffer.getvalue()
 
-                  con.execute(incoming_sql)
-                  con.execute(outgoing_sql)
+          if not incoming_data:
+              raise RuntimeError(
+                  "Warehouse Incoming Parquet is empty"
+              )
 
-                  con.execute(
-                      f"""
-                      COPY log_warehouse_incoming
-                      TO '{incoming_output_path}'
-                      (FORMAT PARQUET, COMPRESSION ZSTD)
-                      """
-                  )
+          if not outgoing_data:
+              raise RuntimeError(
+                  "Warehouse Outgoing Parquet is empty"
+              )
 
-                  con.execute(
-                      f"""
-                      COPY log_warehouse_outgoing
-                      TO '{outgoing_output_path}'
-                      (FORMAT PARQUET, COMPRESSION ZSTD)
-                      """
-                  )
+          account_id = os.environ[
+              "CLOUDFLARE_R2_ACCOUNT_ID"
+          ]
 
-                  print("Fetch and transformation successful")
-                  print(
-                      f"Source filename: "
-                      f"{fetcher.suggested_filename}"
-                  )
-                  print(
-                      "R2 incoming object: "
-                      f"{incoming_output_path}"
-                  )
-                  print(
-                      "R2 outgoing object: "
-                      f"{outgoing_output_path}"
-                  )
+          access_key = os.environ[
+              "CLOUDFLARE_R2_ACCESS_KEY_ID"
+          ]
 
-              finally:
-                  con.close()
+          secret_key = os.environ[
+              "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
+          ]
+
+          timestamp = datetime.now(timezone.utc).strftime(
+              "%Y-%m-%dT%H-%M-%SZ"
+          )
+
+          run_id = os.environ["GITHUB_RUN_ID"]
+
+          incoming_key = (
+              "snapshots/webdav-log-warehouse-incoming/"
+              f"{timestamp}-{run_id}.parquet"
+          )
+
+          outgoing_key = (
+              "snapshots/webdav-log-warehouse-outgoing/"
+              f"{timestamp}-{run_id}.parquet"
+          )
+
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=(
+                  f"https://{account_id}.r2.cloudflarestorage.com"
+              ),
+              aws_access_key_id=access_key,
+              aws_secret_access_key=secret_key,
+              region_name="auto",
+              config=Config(signature_version="s3v4"),
+          )
+
+          s3.put_object(
+              Bucket="data-bridge",
+              Key=incoming_key,
+              Body=incoming_data,
+              ContentType="application/vnd.apache.parquet",
+          )
+
+          s3.put_object(
+              Bucket="data-bridge",
+              Key=outgoing_key,
+              Body=outgoing_data,
+              ContentType="application/vnd.apache.parquet",
+          )
+
+          print("Fetch and transformation successful")
+          print(f"Source filename: {fetcher.suggested_filename}")
+          print(f"Incoming rows: {incoming.height}")
+          print(f"Outgoing rows: {outgoing.height}")
+          print(
+              "Incoming R2 object: "
+              f"s3://data-bridge/{incoming_key}"
+          )
+          print(
+              "Outgoing R2 object: "
+              f"s3://data-bridge/{outgoing_key}"
+          )
+          print("Output schema verification: passed")
           PY
