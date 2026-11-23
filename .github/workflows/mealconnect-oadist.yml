@@ -2,6 +2,7 @@ name: MealConnect OADist Fetcher
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
