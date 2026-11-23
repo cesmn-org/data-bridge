@@ -29,13 +29,14 @@ jobs:
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Fetch and upload Parquet
+      - name: Fetch, transform, and upload Parquet
         env:
           MEALCONNECT_USERNAME: ${{ secrets.MEALCONNECT_USERNAME }}
           MEALCONNECT_PASSWORD: ${{ secrets.MEALCONNECT_PASSWORD }}
           CLOUDFLARE_R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
           CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
           CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           python - <<'PY'
           import csv
@@ -46,6 +47,7 @@ jobs:
 
           import duckdb
           from libfetch import OADist
+
 
           expected_columns = [
               "OrderType",
@@ -66,7 +68,13 @@ jobs:
 
           source_bytes = fetcher.to_bytes()
 
-          with tempfile.NamedTemporaryFile(suffix=".csv") as source_file:
+          if not source_bytes:
+              raise RuntimeError("The downloaded report is empty")
+
+          with tempfile.NamedTemporaryFile(
+              mode="wb",
+              suffix=".csv",
+          ) as source_file:
               source_file.write(source_bytes)
               source_file.flush()
 
@@ -75,19 +83,24 @@ jobs:
                   encoding="utf-8-sig",
                   newline="",
               ) as csv_file:
-                  actual_columns = next(csv.reader(csv_file))
+                  actual_columns = next(csv.reader(csv_file), None)
 
               if actual_columns != expected_columns:
                   raise RuntimeError(
-                      f"Unexpected columns: {actual_columns}"
+                      "Unexpected source columns:\n"
+                      f"Expected: {expected_columns}\n"
+                      f"Actual:   {actual_columns}"
                   )
 
-              account_id = os.environ["CLOUDFLARE_R2_ACCOUNT_ID"]
-              access_key = os.environ[
+              os.environ["AWS_ACCESS_KEY_ID"] = os.environ[
                   "CLOUDFLARE_R2_ACCESS_KEY_ID"
               ]
-              secret_key = os.environ[
+              os.environ["AWS_SECRET_ACCESS_KEY"] = os.environ[
                   "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
+              ]
+
+              account_id = os.environ[
+                  "CLOUDFLARE_R2_ACCOUNT_ID"
               ]
 
               timestamp = datetime.now(timezone.utc).strftime(
@@ -97,60 +110,59 @@ jobs:
               output_path = (
                   "s3://data-bridge/"
                   "snapshots/mealconnect-oadist/"
-                  f"{timestamp}.parquet"
+                  f"{timestamp}-{os.environ['GITHUB_RUN_ID']}.parquet"
               )
 
               con = duckdb.connect()
 
-              con.execute("INSTALL httpfs")
-              con.execute("LOAD httpfs")
+              try:
+                  con.execute("INSTALL httpfs")
+                  con.execute("LOAD httpfs")
 
-              con.execute(
-                  "SET s3_region = ?",
-                  ["auto"],
-              )
-              con.execute(
-                  "SET s3_endpoint = ?",
-                  [f"{account_id}.r2.cloudflarestorage.com"],
-              )
-              con.execute(
-                  "SET s3_access_key_id = ?",
-                  [access_key],
-              )
-              con.execute(
-                  "SET s3_secret_access_key = ?",
-                  [secret_key],
-              )
-
-              con.execute(
-                  """
-                  CREATE VIEW input_data AS
-                  SELECT *
-                  FROM read_csv(
-                      ?,
-                      header = true,
-                      all_varchar = true
+                  con.execute(
+                      f"""
+                      CREATE OR REPLACE SECRET r2_secret (
+                          TYPE R2,
+                          PROVIDER credential_chain,
+                          CHAIN 'env',
+                          ACCOUNT_ID '{account_id}'
+                      )
+                      """
                   )
-                  """,
-                  [source_file.name],
-              )
 
-              sql = Path(
-                  "sql/sources/mealconnect-oadist.sql"
-              ).read_text(encoding="utf-8")
+                  con.execute(
+                      """
+                      CREATE VIEW input_data AS
+                      SELECT *
+                      FROM read_csv(
+                          ?,
+                          header = true,
+                          all_varchar = true,
+                          encoding = 'utf-8'
+                      )
+                      """,
+                      [source_file.name],
+                  )
 
-              con.execute(sql)
+                  sql = Path(
+                      "sql/sources/mealconnect-oadist.sql"
+                  ).read_text(encoding="utf-8")
 
-              con.execute(
-                  """
-                  COPY oa_distribution
-                  TO ?
-                  (FORMAT PARQUET, COMPRESSION ZSTD)
-                  """,
-                  [output_path],
-              )
+                  con.execute(sql)
 
-              con.close()
+                  con.execute(
+                      """
+                      COPY oa_distribution
+                      TO ?
+                      (FORMAT PARQUET, COMPRESSION ZSTD)
+                      """,
+                      [output_path],
+                  )
 
-              print(f"Uploaded {output_path}")
+                  print("Fetch and transformation successful")
+                  print(f"Source filename: {fetcher.suggested_filename}")
+                  print(f"R2 object: {output_path}")
+
+              finally:
+                  con.close()
           PY
