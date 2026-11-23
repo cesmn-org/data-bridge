@@ -1,3 +1,4 @@
+
 from datetime import date
 
 import polars as pl
@@ -29,22 +30,46 @@ OUTPUT_SCHEMA = pl.Schema(
 )
 
 
-def _excel_date(column: str) -> pl.Expr:
-    return (
+def _service_date() -> pl.Expr:
+    value = pl.col("Date").cast(pl.String, strict=True).str.strip_chars()
+
+    parsed_datetime = value.str.strptime(
+        pl.Datetime,
+        format="%Y-%m-%d %H:%M:%S",
+        strict=False,
+    ).dt.date()
+
+    parsed_date = value.str.strptime(
+        pl.Date,
+        format="%Y-%m-%d",
+        strict=False,
+    )
+
+    excel_serial = (
         pl.lit(date(1899, 12, 30))
         + pl.duration(
-            days=pl.col(column)
-            .cast(pl.Float64, strict=True)
-            .cast(pl.Int64, strict=True)
+            days=value.cast(pl.Int64, strict=False)
         )
+    ).cast(pl.Date)
+
+    return pl.coalesce(
+        [
+            parsed_datetime,
+            parsed_date,
+            excel_serial,
+        ]
     )
 
 
 def _integer_with_blank_as_zero(column: str) -> pl.Expr:
-    return (
+    value = (
         pl.col(column)
-        .cast(pl.String, strict=False)
+        .cast(pl.String, strict=True)
         .str.strip_chars()
+    )
+
+    return (
+        value
         .replace("", "0")
         .cast(pl.Int64, strict=True)
     )
@@ -52,7 +77,7 @@ def _integer_with_blank_as_zero(column: str) -> pl.Expr:
 
 def transform(df: pl.DataFrame) -> pl.DataFrame:
     return df.select(
-        _excel_date("Date").alias("service_date"),
+        _service_date().alias("service_date"),
 
         pl.col("Program")
         .cast(pl.String, strict=True)
@@ -75,14 +100,14 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
 
         pl.when(
             pl.col("Note")
-            .cast(pl.String, strict=False)
+            .cast(pl.String, strict=True)
             .str.strip_chars()
             == ""
         )
         .then(pl.lit(None, dtype=pl.String))
         .otherwise(
             pl.col("Note")
-            .cast(pl.String, strict=False)
+            .cast(pl.String, strict=True)
             .str.strip_chars()
         )
         .alias("note"),
