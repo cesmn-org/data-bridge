@@ -19,12 +19,16 @@ WAREHOUSE_INCOMING_PREFIX = (
 WAREHOUSE_OUTGOING_PREFIX = (
     "snapshots/webdav-log-warehouse-outgoing/"
 )
+OA_ORDERS_PREFIX = (
+    "snapshots/mealconnect-oaorders/"
+)
 
 OA_DISTRIBUTION_TABLE = "oa_distribution"
 ANONYMOUS_PROGRAMS_TABLE = "log_anonymous_programs"
 RESCUE_TABLE = "log_rescue"
 WAREHOUSE_INCOMING_TABLE = "log_warehouse_incoming"
 WAREHOUSE_OUTGOING_TABLE = "log_warehouse_outgoing"
+OA_ORDERS_TABLE = "oa_orders"
 
 R2_SECRET_NAME = "data_bridge_r2"
 
@@ -91,11 +95,33 @@ def select_ducklake_database(con) -> str:
         "MOTHERDUCK_DUCKLAKE_NAME"
     )
 
-    escaped_name = database_name.replace('"', '""')
+    escaped_name = database_name.replace(
+        '"',
+        '""',
+    )
 
     con.execute(f'USE "{escaped_name}"')
 
     return database_name
+
+
+def require_nonempty_table(
+    con,
+    table_name: str,
+) -> int:
+    row_count = con.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM {table_name}
+        """
+    ).fetchone()[0]
+
+    if row_count == 0:
+        raise RuntimeError(
+            f"MotherDuck table is empty: {table_name}"
+        )
+
+    return row_count
 
 
 def load_oa_distribution(con) -> int:
@@ -324,20 +350,34 @@ def load_warehouse_outgoing(con) -> int:
     )
 
 
-def require_nonempty_table(con, table_name: str) -> int:
-    row_count = con.execute(
+def load_oa_orders(con) -> int:
+    snapshot_glob = (
+        f"r2://{BUCKET}/"
+        f"{OA_ORDERS_PREFIX}*.parquet"
+    )
+
+    con.execute(
         f"""
-        SELECT COUNT(*)
-        FROM {table_name}
-        """
-    ).fetchone()[0]
-
-    if row_count == 0:
-        raise RuntimeError(
-            f"MotherDuck table is empty: {table_name}"
+        CREATE OR REPLACE TABLE {OA_ORDERS_TABLE} AS
+        SELECT * EXCLUDE (filename)
+        FROM read_parquet(
+            {sql_string(snapshot_glob)},
+            filename = true
         )
+        WHERE filename = (
+            SELECT MAX(filename)
+            FROM read_parquet(
+                {sql_string(snapshot_glob)},
+                filename = true
+            )
+        )
+        """
+    )
 
-    return row_count
+    return require_nonempty_table(
+        con,
+        OA_ORDERS_TABLE,
+    )
 
 
 def main() -> None:
@@ -350,16 +390,22 @@ def main() -> None:
         oa_distribution_row_count = (
             load_oa_distribution(con)
         )
+
         anonymous_programs_row_count = (
             load_anonymous_programs(con)
         )
+
         rescue_row_count = load_rescue(con)
+
         warehouse_incoming_row_count = (
             load_warehouse_incoming(con)
         )
+
         warehouse_outgoing_row_count = (
             load_warehouse_outgoing(con)
         )
+
+        oa_orders_row_count = load_oa_orders(con)
 
         warehouse_incoming_sample = con.execute(
             f"""
@@ -389,6 +435,24 @@ def main() -> None:
             """
         ).fetchall()
 
+        oa_orders_sample = con.execute(
+            f"""
+            SELECT
+                client_id,
+                order_id,
+                order_number,
+                order_status,
+                place_of_service,
+                date_of_service,
+                household_size,
+                gender_identity,
+                race_ethnicity
+            FROM {OA_ORDERS_TABLE}
+            ORDER BY created, order_number
+            LIMIT 5
+            """
+        ).fetchall()
+
     finally:
         con.close()
 
@@ -399,14 +463,17 @@ def main() -> None:
         f"Table: {OA_DISTRIBUTION_TABLE}; "
         f"rows: {oa_distribution_row_count}"
     )
+
     print(
         f"Table: {ANONYMOUS_PROGRAMS_TABLE}; "
         f"rows: {anonymous_programs_row_count}"
     )
+
     print(
         f"Table: {RESCUE_TABLE}; "
         f"rows: {rescue_row_count}"
     )
+
     print(
         f"Table: {WAREHOUSE_INCOMING_TABLE}; "
         f"rows: {warehouse_incoming_row_count}"
@@ -423,6 +490,15 @@ def main() -> None:
     print("Sample outgoing rows:")
 
     for row in warehouse_outgoing_sample:
+        print(row)
+
+    print(
+        f"Table: {OA_ORDERS_TABLE}; "
+        f"rows: {oa_orders_row_count}"
+    )
+    print("Sample OA Orders rows:")
+
+    for row in oa_orders_sample:
         print(row)
 
 
