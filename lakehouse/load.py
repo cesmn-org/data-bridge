@@ -22,6 +22,9 @@ WAREHOUSE_OUTGOING_PREFIX = (
 OA_ORDERS_PREFIX = (
     "snapshots/mealconnect-oaorders/"
 )
+CNC_ORDERS_PREFIX = (
+    "snapshots/clickncollect-orders/"
+)
 
 OA_DISTRIBUTION_TABLE = "oa_distribution"
 ANONYMOUS_PROGRAMS_TABLE = "log_anonymous_programs"
@@ -29,6 +32,7 @@ RESCUE_TABLE = "log_rescue"
 WAREHOUSE_INCOMING_TABLE = "log_warehouse_incoming"
 WAREHOUSE_OUTGOING_TABLE = "log_warehouse_outgoing"
 OA_ORDERS_TABLE = "oa_orders"
+CNC_ORDERS_TABLE = "click_n_collect_orders"
 
 R2_SECRET_NAME = "data_bridge_r2"
 
@@ -380,6 +384,36 @@ def load_oa_orders(con) -> int:
     )
 
 
+def load_cnc_orders(con) -> int:
+    snapshot_glob = (
+        f"r2://{BUCKET}/"
+        f"{CNC_ORDERS_PREFIX}*.parquet"
+    )
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {CNC_ORDERS_TABLE} AS
+        SELECT * EXCLUDE (filename)
+        FROM read_parquet(
+            {sql_string(snapshot_glob)},
+            filename = true
+        )
+        WHERE filename = (
+            SELECT MAX(filename)
+            FROM read_parquet(
+                {sql_string(snapshot_glob)},
+                filename = true
+            )
+        )
+        """
+    )
+
+    return require_nonempty_table(
+        con,
+        CNC_ORDERS_TABLE,
+    )
+
+
 def main() -> None:
     con = connect_to_motherduck()
 
@@ -406,6 +440,8 @@ def main() -> None:
         )
 
         oa_orders_row_count = load_oa_orders(con)
+
+        cnc_orders_row_count = load_cnc_orders(con)
 
         warehouse_incoming_sample = con.execute(
             f"""
@@ -449,6 +485,24 @@ def main() -> None:
                 race_ethnicity
             FROM {OA_ORDERS_TABLE}
             ORDER BY created, order_number
+            LIMIT 5
+            """
+        ).fetchall()
+
+        cnc_orders_sample = con.execute(
+            f"""
+            SELECT
+                location,
+                locker_terminal,
+                order_id,
+                tracking_id,
+                locker_number,
+                order_date,
+                locker_status,
+                delivery_datetime,
+                pickup_datetime
+            FROM {CNC_ORDERS_TABLE}
+            ORDER BY order_date, tracking_id
             LIMIT 5
             """
         ).fetchall()
@@ -499,6 +553,15 @@ def main() -> None:
     print("Sample OA Orders rows:")
 
     for row in oa_orders_sample:
+        print(row)
+
+    print(
+        f"Table: {CNC_ORDERS_TABLE}; "
+        f"rows: {cnc_orders_row_count}"
+    )
+    print("Sample Click N Collect rows:")
+
+    for row in cnc_orders_sample:
         print(row)
 
 
