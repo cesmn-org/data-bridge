@@ -1,0 +1,53 @@
+name: Data Bridge Orchestrator
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: data-bridge-orchestrator
+  cancel-in-progress: false
+
+jobs:
+  mealconnect-oadist:
+    name: MealConnect distribution
+    uses: ./.github/workflows/mealconnect-oadist.yml
+    secrets: inherit
+
+  webdav-log-anonymous-programs:
+    name: WebDAV anonymous-program log
+    needs: mealconnect-oadist
+    uses: ./.github/workflows/webdav-log-anonymous-programs.yml
+    secrets: inherit
+
+  webdav-log-rescue:
+    name: WebDAV rescue log
+    needs: webdav-log-anonymous-programs
+    uses: ./.github/workflows/webdav-log-rescue.yml
+    secrets: inherit
+
+  webdav-log-warehouse:
+    name: WebDAV warehouse log
+    needs: webdav-log-rescue
+    uses: ./.github/workflows/webdav-log-warehouse.yml
+    secrets: inherit
+
+  mealconnect-oaorders:
+    name: MealConnect orders
+    needs: webdav-log-warehouse
+    uses: ./.github/workflows/mealconnect-oaorders.yml
+    secrets: inherit
+
+  clickncollect-orders:
+    name: Click N Collect orders
+    needs: mealconnect-oaorders
+    uses: ./.github/workflows/clickncollect-orders.yml
+    secrets: inherit
+
+  lakehouse-load:
+    name: Lakehouse load
+    needs: clickncollect-orders
+    uses: ./.github/workflows/lakehouse-load.yml
+    secrets: inherit
