@@ -60,8 +60,14 @@ jobs:
 
           connection.execute("INSTALL ducklake")
           connection.execute("LOAD ducklake")
+
           connection.execute(
-              "ATTACH 'ducklake:/tmp/catalog.duckdb' AS lake"
+              """
+              ATTACH 'ducklake:/tmp/catalog.duckdb' AS lake
+              (
+                  METADATA_CATALOG 'lake_metadata'
+              )
+              """
           )
 
           queries = [
@@ -69,7 +75,7 @@ jobs:
                   "data_path",
                   """
                   SELECT key, value
-                  FROM lake.main.ducklake_metadata
+                  FROM lake_metadata.main.ducklake_metadata
                   WHERE key = 'data_path';
                   """,
               ),
@@ -77,14 +83,14 @@ jobs:
                   "schemas",
                   """
                   SELECT schema_id, schema_name, path, path_is_relative
-                  FROM lake.main.ducklake_schema;
+                  FROM lake_metadata.main.ducklake_schema;
                   """,
               ),
               (
                   "tables",
                   """
                   SELECT table_name, path, path_is_relative
-                  FROM lake.main.ducklake_table;
+                  FROM lake_metadata.main.ducklake_table;
                   """,
               ),
           ]
