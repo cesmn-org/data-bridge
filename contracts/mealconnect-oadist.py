@@ -22,11 +22,26 @@ OUTPUT_SCHEMA = pl.Schema(
         "item_location": pl.String,
         "item_name": pl.String,
         "quantity": pl.Int64,
-        "unit_pounds": pl.Decimal(precision=12, scale=2),
-        "total_pounds": pl.Decimal(precision=12, scale=2),
+        "unit_pounds": pl.Decimal(
+            precision=12,
+            scale=2,
+        ),
+        "total_pounds": pl.Decimal(
+            precision=12,
+            scale=2,
+        ),
         "is_tefap": pl.Boolean,
     }
 )
+
+
+# Lakehouse loading contract
+
+SNAPSHOT_PREFIX = (
+    "snapshots/mealconnect-oadist/"
+)
+
+TABLE_NAME = "oa_distribution"
 
 
 def transform(df: pl.DataFrame) -> pl.DataFrame:
@@ -109,3 +124,79 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         .otherwise(pl.lit(False))
         .alias("is_tefap"),
     )
+
+
+def load(
+    con,
+    bucket: str,
+    sql_string,
+    require_nonempty_table,
+) -> int:
+    snapshot_glob = (
+        f"r2://{bucket}/"
+        f"{SNAPSHOT_PREFIX}*.parquet"
+    )
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {TABLE_NAME} AS
+        SELECT
+            order_type,
+            order_location,
+            distribution_date,
+            item_location,
+            item_name,
+            quantity,
+            unit_pounds,
+            total_pounds,
+            is_tefap
+        FROM (
+            SELECT
+                order_type,
+                order_location,
+                distribution_date,
+                item_location,
+                item_name,
+                quantity,
+                unit_pounds,
+                total_pounds,
+                is_tefap,
+                ROW_NUMBER() OVER (
+                    PARTITION BY
+                        distribution_date,
+                        order_type,
+                        order_location,
+                        item_location,
+                        item_name
+                    ORDER BY filename DESC
+                ) AS row_number
+            FROM read_parquet(
+                {sql_string(snapshot_glob)},
+                filename = true
+            )
+        )
+        WHERE row_number = 1
+        """
+    )
+
+    return require_nonempty_table(
+        con,
+        TABLE_NAME,
+    )
+
+
+def sample(con) -> list[tuple]:
+    return con.execute(
+        f"""
+        SELECT
+            order_type,
+            order_location,
+            distribution_date,
+            item_name,
+            total_pounds,
+            is_tefap
+        FROM {TABLE_NAME}
+        ORDER BY distribution_date, item_name
+        LIMIT 5
+        """
+    ).fetchall()
