@@ -24,7 +24,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install \
             "git+https://github.com/cesmn-org/libfetch.git" \
-            duckdb
+            polars \
+            fastexcel \
+            boto3
 
       - name: Fetch, transform, and upload Parquet
         env:
@@ -36,28 +38,40 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           python - <<'PY'
-          import csv
+          import io
           import os
-          import tempfile
           from datetime import datetime, timezone
+          from importlib.util import module_from_spec
+          from importlib.util import spec_from_file_location
           from pathlib import Path
 
-          import duckdb
+          import boto3
+          import polars as pl
+
+          from botocore.config import Config
           from libfetch import LogRescue
 
 
-          expected_columns = [
-              "Date",
-              "Location",
-              "Bakery",
-              "Dairy",
-              "Deli",
-              "Dry",
-              "Frozen",
-              "Nonfood",
-              "Produce",
-              "Total",
-          ]
+          contract_path = Path(
+              "contracts/webdav-log-rescue.py"
+          )
+
+          spec = spec_from_file_location(
+              "webdav_log_rescue_contract",
+              contract_path,
+          )
+
+          if spec is None or spec.loader is None:
+              raise RuntimeError(
+                  f"Could not load contract: {contract_path}"
+              )
+
+          contract = module_from_spec(spec)
+          spec.loader.exec_module(contract)
+
+          raw_columns = contract.RAW_COLUMNS
+          output_schema = contract.OUTPUT_SCHEMA
+          transform = contract.transform
 
           fetcher = LogRescue(
               os.environ["WEBDAV_USERNAME"],
@@ -69,92 +83,123 @@ jobs:
           if not source_bytes:
               raise RuntimeError("The downloaded workbook is empty")
 
-          with tempfile.NamedTemporaryFile(
-              mode="wb",
-              suffix=".xlsx",
-          ) as source_file:
-              source_file.write(source_bytes)
-              source_file.flush()
+          raw = pl.read_excel(
+              io.BytesIO(source_bytes),
+              sheet_name="Log",
+              engine="calamine",
+              read_options={
+                  "header_row": 2,
+              },
+              schema_overrides={
+                  column: pl.String
+                  for column in raw_columns
+              },
+          )
 
-              account_id = os.environ[
-                  "CLOUDFLARE_R2_ACCOUNT_ID"
-              ]
+          actual_columns = raw.columns
 
-              access_key = os.environ[
-                  "CLOUDFLARE_R2_ACCESS_KEY_ID"
-              ]
-
-              secret_key = os.environ[
-                  "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
-              ]
-
-              os.environ["AWS_ACCESS_KEY_ID"] = access_key
-              os.environ["AWS_SECRET_ACCESS_KEY"] = secret_key
-
-              timestamp = datetime.now(timezone.utc).strftime(
-                  "%Y-%m-%dT%H-%M-%SZ"
+          if len(actual_columns) != len(set(actual_columns)):
+              duplicates = sorted(
+                  column
+                  for column in set(actual_columns)
+                  if actual_columns.count(column) > 1
+              )
+              raise RuntimeError(
+                  "Duplicate source columns: "
+                  f"{duplicates}"
               )
 
-              output_path = (
-                  "r2://data-bridge/"
-                  "snapshots/webdav-log-rescue/"
-                  f"{timestamp}-"
-                  f"{os.environ['GITHUB_RUN_ID']}.parquet"
+          missing_columns = sorted(
+              set(raw_columns) - set(actual_columns)
+          )
+
+          unexpected_columns = sorted(
+              set(actual_columns) - set(raw_columns)
+          )
+
+          if missing_columns or unexpected_columns:
+              raise RuntimeError(
+                  "Rescue source schema mismatch.\n"
+                  f"Missing columns: {missing_columns}\n"
+                  f"Unexpected columns: {unexpected_columns}"
               )
 
-              con = duckdb.connect()
+          if actual_columns != raw_columns:
+              raise RuntimeError(
+                  "Rescue source columns are in an unexpected order"
+              )
 
-              try:
-                  con.execute("INSTALL excel")
-                  con.execute("LOAD excel")
-                  con.execute("INSTALL httpfs")
-                  con.execute("LOAD httpfs")
+          output = transform(raw)
 
-                  con.execute(
-                      f"""
-                      CREATE OR REPLACE SECRET r2_secret (
-                          TYPE R2,
-                          PROVIDER credential_chain,
-                          CHAIN 'env',
-                          ACCOUNT_ID '{account_id}'
-                      )
-                      """
-                  )
+          if output.schema != output_schema:
+              raise RuntimeError(
+                  "Unexpected canonical output schema.\n"
+                  f"Expected: {output_schema}\n"
+                  f"Actual: {output.schema}"
+              )
 
-                  con.execute(
-                      f"""
-                      CREATE VIEW input_data AS
-                      SELECT *
-                      FROM read_xlsx(
-                          '{source_file.name}',
-                          sheet = 'Log',
-                          range = 'A3:J',
-                          all_varchar = true
-                      )
-                      """
-                  )
+          if output.height == 0:
+              raise RuntimeError(
+                  "The transformed worksheet contains no rows"
+              )
 
-                  sql = Path(
-                      "sql/sources/webdav-log-rescue.sql"
-                  ).read_text(encoding="utf-8")
+          parquet_buffer = io.BytesIO()
 
-                  con.execute(sql)
+          output.write_parquet(
+              parquet_buffer,
+              compression="zstd",
+          )
 
-                  con.execute(
-                      f"""
-                      COPY log_rescue
-                      TO '{output_path}'
-                      (FORMAT PARQUET, COMPRESSION ZSTD)
-                      """
-                  )
+          parquet_data = parquet_buffer.getvalue()
 
-                  print("Fetch and transformation successful")
-                  print(
-                      f"Source filename: "
-                      f"{fetcher.suggested_filename}"
-                  )
-                  print(f"R2 object: {output_path}")
+          if not parquet_data:
+              raise RuntimeError(
+                  "Parquet generation produced an empty file"
+              )
 
-              finally:
-                  con.close()
+          account_id = os.environ[
+              "CLOUDFLARE_R2_ACCOUNT_ID"
+          ]
+
+          access_key = os.environ[
+              "CLOUDFLARE_R2_ACCESS_KEY_ID"
+          ]
+
+          secret_key = os.environ[
+              "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
+          ]
+
+          timestamp = datetime.now(timezone.utc).strftime(
+              "%Y-%m-%dT%H-%M-%SZ"
+          )
+
+          object_key = (
+              "snapshots/webdav-log-rescue/"
+              f"{timestamp}-"
+              f"{os.environ['GITHUB_RUN_ID']}.parquet"
+          )
+
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=(
+                  f"https://{account_id}.r2.cloudflarestorage.com"
+              ),
+              aws_access_key_id=access_key,
+              aws_secret_access_key=secret_key,
+              region_name="auto",
+              config=Config(signature_version="s3v4"),
+          )
+
+          s3.put_object(
+              Bucket="data-bridge",
+              Key=object_key,
+              Body=parquet_data,
+              ContentType="application/vnd.apache.parquet",
+          )
+
+          print("Fetch and transformation successful")
+          print(f"Source filename: {fetcher.suggested_filename}")
+          print(f"Rows: {output.height}")
+          print(f"R2 object: s3://data-bridge/{object_key}")
+          print("Output schema verification: passed")
           PY
