@@ -1,0 +1,97 @@
+name: Inspect lakehouse metadata
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect-lakehouse-metadata:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      R2_BUCKET: data-bridge
+      CATALOG_KEY: lakehouse/catalog.duckdb
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check duckdb boto3
+
+      - name: Download catalog and inspect metadata
+        run: |
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          import boto3
+          import duckdb
+
+          catalog_path = Path("/tmp/catalog.duckdb")
+
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=os.environ["R2_ENDPOINT"],
+              aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+              aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+              region_name=os.environ["AWS_DEFAULT_REGION"],
+          )
+
+          s3.download_file(
+              os.environ["R2_BUCKET"],
+              os.environ["CATALOG_KEY"],
+              str(catalog_path),
+          )
+
+          connection = duckdb.connect()
+          connection.execute("INSTALL ducklake FROM community")
+          connection.execute("LOAD ducklake")
+          connection.execute(
+              "ATTACH 'ducklake:/tmp/catalog.duckdb' AS lake"
+          )
+
+          queries = [
+              """
+              SELECT key, value
+              FROM lake.ducklake_metadata
+              WHERE key = 'data_path';
+              """,
+              """
+              SELECT schema_id, schema_name, path, path_is_relative
+              FROM lake.ducklake_schema;
+              """,
+              """
+              SELECT table_name, path, path_is_relative
+              FROM lake.ducklake_table;
+              """,
+          ]
+
+          for query in queries:
+              result = connection.execute(query)
+              columns = [column[0] for column in result.description]
+
+              print("\t".join(columns))
+              for row in result.fetchall():
+                  print(
+                      "\t".join(
+                          "" if value is None else str(value)
+                          for value in row
+                      )
+                  )
+              print()
+
+          connection.close()
+          PY
