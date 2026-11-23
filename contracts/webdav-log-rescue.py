@@ -33,6 +33,15 @@ OUTPUT_SCHEMA = pl.Schema(
 )
 
 
+# Lakehouse loading contract
+
+SNAPSHOT_PREFIX = (
+    "snapshots/webdav-log-rescue/"
+)
+
+TABLE_NAME = "log_rescue"
+
+
 def _rescue_date() -> pl.Expr:
     value = (
         pl.col("Date")
@@ -71,7 +80,9 @@ def _rescue_date() -> pl.Expr:
     )
 
 
-def _integer_with_blank_as_zero(column: str) -> pl.Expr:
+def _integer_with_blank_as_zero(
+    column: str,
+) -> pl.Expr:
     value = (
         pl.col(column)
         .cast(pl.String, strict=True)
@@ -116,3 +127,78 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         _integer_with_blank_as_zero("Total")
         .alias("total"),
     )
+
+
+def load(
+    con,
+    bucket: str,
+    sql_string,
+    require_nonempty_table,
+) -> int:
+    snapshot_glob = (
+        f"r2://{bucket}/"
+        f"{SNAPSHOT_PREFIX}*.parquet"
+    )
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {TABLE_NAME} AS
+        SELECT
+            rescue_date,
+            location,
+            bakery,
+            dairy,
+            deli,
+            dry,
+            frozen,
+            nonfood,
+            produce,
+            total
+        FROM (
+            SELECT
+                rescue_date,
+                location,
+                bakery,
+                dairy,
+                deli,
+                dry,
+                frozen,
+                nonfood,
+                produce,
+                total,
+                filename,
+                MAX(filename) OVER () AS latest_filename
+            FROM read_parquet(
+                {sql_string(snapshot_glob)},
+                filename = true
+            )
+        )
+        WHERE filename = latest_filename
+        """
+    )
+
+    return require_nonempty_table(
+        con,
+        TABLE_NAME,
+    )
+
+
+def sample(con) -> list[tuple]:
+    return con.execute(
+        f"""
+        SELECT
+            rescue_date,
+            location,
+            bakery,
+            dairy,
+            deli,
+            dry,
+            frozen,
+            nonfood,
+            produce,
+            total
+        FROM {TABLE_NAME}
+        ORDER BY rescue_date, location
+        LIMIT 5
+        """
+    ).fetchall()
