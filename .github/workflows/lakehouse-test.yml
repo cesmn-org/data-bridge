@@ -19,9 +19,6 @@ jobs:
       CATALOG_KEY: lakehouse/catalog.duckdb
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -29,9 +26,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python3 -m pip install --disable-pip-version-check duckdb boto3
+          python3 -m pip install --disable-pip-version-check \
+            duckdb \
+            boto3
 
-      - name: Download catalog and inspect metadata
+      - name: Download catalog and inspect DuckLake metadata
         run: |
           python3 <<'PY'
           import os
@@ -41,6 +40,7 @@ jobs:
           import duckdb
 
           catalog_path = Path("/tmp/catalog.duckdb")
+          report_path = Path("/tmp/lakehouse-metadata.txt")
 
           s3 = boto3.client(
               "s3",
@@ -57,41 +57,75 @@ jobs:
           )
 
           connection = duckdb.connect()
-          connection.execute("INSTALL ducklake FROM community")
+
+          connection.execute("INSTALL ducklake")
           connection.execute("LOAD ducklake")
+
           connection.execute(
               "ATTACH 'ducklake:/tmp/catalog.duckdb' AS lake"
           )
 
           queries = [
-              """
-              SELECT key, value
-              FROM lake.ducklake_metadata
-              WHERE key = 'data_path';
-              """,
-              """
-              SELECT schema_id, schema_name, path, path_is_relative
-              FROM lake.ducklake_schema;
-              """,
-              """
-              SELECT table_name, path, path_is_relative
-              FROM lake.ducklake_table;
-              """,
+              (
+                  "data_path",
+                  """
+                  SELECT key, value
+                  FROM lake.ducklake_metadata
+                  WHERE key = 'data_path';
+                  """,
+              ),
+              (
+                  "schemas",
+                  """
+                  SELECT schema_id, schema_name, path, path_is_relative
+                  FROM lake.ducklake_schema;
+                  """,
+              ),
+              (
+                  "tables",
+                  """
+                  SELECT table_name, path, path_is_relative
+                  FROM lake.ducklake_table;
+                  """,
+              ),
           ]
 
-          for query in queries:
+          report_lines = []
+
+          for title, query in queries:
               result = connection.execute(query)
               columns = [column[0] for column in result.description]
+              rows = result.fetchall()
 
+              report_lines.append(f"--- {title} ---")
+              report_lines.append("\t".join(columns))
+
+              print(f"--- {title} ---")
               print("\t".join(columns))
-              for row in result.fetchall():
-                  print(
-                      "\t".join(
-                          "" if value is None else str(value)
-                          for value in row
-                      )
-                  )
+
+              for row in rows:
+                  values = [
+                      "" if value is None else str(value)
+                      for value in row
+                  ]
+                  line = "\t".join(values)
+                  report_lines.append(line)
+                  print(line)
+
+              report_lines.append("")
               print()
+
+          report_path.write_text(
+              "\n".join(report_lines),
+              encoding="utf-8",
+          )
 
           connection.close()
           PY
+
+      - name: Upload metadata report
+        uses: actions/upload-artifact@v4
+        with:
+          name: lakehouse-metadata-${{ github.run_id }}
+          path: /tmp/lakehouse-metadata.txt
+          if-no-files-found: error
