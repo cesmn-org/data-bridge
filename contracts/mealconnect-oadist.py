@@ -30,6 +30,26 @@ OUTPUT_SCHEMA = pl.Schema(
 
 
 def transform(df: pl.DataFrame) -> pl.DataFrame:
+    tefap_values = (
+        df.get_column("IsTEFAP")
+        .str.strip_chars()
+        .str.to_lowercase()
+        .unique()
+        .to_list()
+    )
+
+    invalid_tefap_values = sorted(
+        value
+        for value in tefap_values
+        if value not in {"true", "false"}
+    )
+
+    if invalid_tefap_values:
+        raise ValueError(
+            "Invalid IsTEFAP values: "
+            f"{invalid_tefap_values}"
+        )
+
     return df.select(
         pl.col("OrderType")
         .cast(pl.String, strict=True)
@@ -79,9 +99,13 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         )
         .alias("total_pounds"),
 
-        pl.col("IsTEFAP")
-        .str.strip_chars()
-        .str.to_lowercase()
-        .cast(pl.Boolean, strict=True)
+        pl.when(
+            pl.col("IsTEFAP")
+            .str.strip_chars()
+            .str.to_lowercase()
+            == "true"
+        )
+        .then(pl.lit(True))
+        .otherwise(pl.lit(False))
         .alias("is_tefap"),
     )
