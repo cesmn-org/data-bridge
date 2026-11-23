@@ -24,8 +24,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install \
             "git+https://github.com/cesmn-org/libfetch.git" \
-            duckdb \
-            fsspec
+            polars \
+            boto3
 
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
@@ -43,11 +43,35 @@ jobs:
           import io
           import os
           from datetime import datetime, timezone
+          from importlib.util import module_from_spec
+          from importlib.util import spec_from_file_location
           from pathlib import Path
 
-          import duckdb
+          import boto3
+          import polars as pl
+
+          from botocore.config import Config
           from libfetch import OADist
 
+
+          contract_path = Path("contracts/mealconnect-oadist.py")
+
+          spec = spec_from_file_location(
+              "mealconnect_oadist_contract",
+              contract_path,
+          )
+
+          if spec is None or spec.loader is None:
+              raise RuntimeError(
+                  f"Could not load contract: {contract_path}"
+              )
+
+          contract = module_from_spec(spec)
+          spec.loader.exec_module(contract)
+
+          raw_columns = contract.RAW_COLUMNS
+          output_schema = contract.OUTPUT_SCHEMA
+          transform = contract.transform
 
           fetcher = OADist(
               os.environ["MEALCONNECT_USERNAME"],
@@ -58,6 +82,73 @@ jobs:
 
           if not source_bytes:
               raise RuntimeError("The downloaded report is empty")
+
+          raw = pl.read_csv(
+              io.BytesIO(source_bytes),
+              infer_schema=False,
+              encoding="utf8",
+          )
+
+          actual_columns = raw.columns
+
+          if len(actual_columns) != len(set(actual_columns)):
+              duplicates = sorted(
+                  column
+                  for column in set(actual_columns)
+                  if actual_columns.count(column) > 1
+              )
+              raise RuntimeError(
+                  "Duplicate source columns: "
+                  f"{duplicates}"
+              )
+
+          missing_columns = sorted(
+              set(raw_columns) - set(actual_columns)
+          )
+
+          unexpected_columns = sorted(
+              set(actual_columns) - set(raw_columns)
+          )
+
+          if missing_columns or unexpected_columns:
+              raise RuntimeError(
+                  "OA Distribution source schema mismatch.\n"
+                  f"Missing columns: {missing_columns}\n"
+                  f"Unexpected columns: {unexpected_columns}"
+              )
+
+          if actual_columns != raw_columns:
+              raise RuntimeError(
+                  "OA Distribution source columns are in an unexpected order"
+              )
+
+          output = transform(raw)
+
+          if output.schema != output_schema:
+              raise RuntimeError(
+                  "Unexpected canonical output schema.\n"
+                  f"Expected: {output_schema}\n"
+                  f"Actual: {output.schema}"
+              )
+
+          if output.height == 0:
+              raise RuntimeError(
+                  "The transformed report contains no rows"
+              )
+
+          parquet_buffer = io.BytesIO()
+
+          output.write_parquet(
+              parquet_buffer,
+              compression="zstd",
+          )
+
+          parquet_data = parquet_buffer.getvalue()
+
+          if not parquet_data:
+              raise RuntimeError(
+                  "Parquet generation produced an empty file"
+              )
 
           account_id = os.environ[
               "CLOUDFLARE_R2_ACCOUNT_ID"
@@ -71,66 +162,37 @@ jobs:
               "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
           ]
 
-          os.environ["AWS_ACCESS_KEY_ID"] = access_key
-          os.environ["AWS_SECRET_ACCESS_KEY"] = secret_key
-
           timestamp = datetime.now(timezone.utc).strftime(
               "%Y-%m-%dT%H-%M-%SZ"
           )
 
-          output_path = (
-              "r2://data-bridge/"
+          object_key = (
               "snapshots/mealconnect-oadist/"
               f"{timestamp}-"
               f"{os.environ['GITHUB_RUN_ID']}.parquet"
           )
 
-          con = duckdb.connect()
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=(
+                  f"https://{account_id}.r2.cloudflarestorage.com"
+              ),
+              aws_access_key_id=access_key,
+              aws_secret_access_key=secret_key,
+              region_name="auto",
+              config=Config(signature_version="s3v4"),
+          )
 
-          try:
-              con.execute("INSTALL httpfs")
-              con.execute("LOAD httpfs")
+          s3.put_object(
+              Bucket="data-bridge",
+              Key=object_key,
+              Body=parquet_data,
+              ContentType="application/vnd.apache.parquet",
+          )
 
-              con.execute(
-                  f"""
-                  CREATE OR REPLACE SECRET r2_secret (
-                      TYPE R2,
-                      PROVIDER credential_chain,
-                      CHAIN 'env',
-                      ACCOUNT_ID '{account_id}'
-                  )
-                  """
-              )
-
-              input_relation = duckdb.read_csv(
-                  io.BytesIO(source_bytes),
-                  header=True,
-                  all_varchar=True,
-              )
-
-              con.register("input_data", input_relation)
-
-              sql = Path(
-                  "sql/sources/mealconnect-oadist.sql"
-              ).read_text(encoding="utf-8")
-
-              con.execute(sql)
-
-              con.execute(
-                  f"""
-                  COPY oa_distribution
-                  TO '{output_path}'
-                  (FORMAT PARQUET, COMPRESSION ZSTD)
-                  """
-              )
-
-              print("Fetch and transformation successful")
-              print(
-                  f"Source filename: "
-                  f"{fetcher.suggested_filename}"
-              )
-              print(f"R2 object: {output_path}")
-
-          finally:
-              con.close()
+          print("Fetch and transformation successful")
+          print(f"Source filename: {fetcher.suggested_filename}")
+          print(f"Rows: {output.height}")
+          print(f"R2 object: s3://data-bridge/{object_key}")
+          print("Output schema verification: passed")
           PY
