@@ -4,10 +4,6 @@ SELECT
     CAST(Source AS VARCHAR) AS source,
     CAST("Transaction Type" AS VARCHAR) AS transaction_type,
     CAST("Product Type" AS VARCHAR) AS product_type,
-    SUM(CAST(NULLIF(TRIM(Pounds), '') AS INTEGER)) AS pounds
-FROM input_incoming
-GROUP BY
-    Date,
-    Source,
-    "Transaction Type",
-    "Product Type";
+    CAST(NULLIF(TRIM(Pounds), '') AS INTEGER) AS pounds,
+    NULLIF(TRIM(Note), '')::VARCHAR AS note
+FROM input_incoming;
