@@ -278,6 +278,18 @@ def main() -> None:
                 """
             )
 
+            con.execute(
+                """
+                CALL lake.set_option(
+                    'data_inlining_row_limit',
+                    0
+                )
+                """
+            )
+
+            con.execute(
+                "CALL ducklake_flush_inlined_data('lake')"
+            )
             load_oa_distribution(
                 con,
                 oa_distribution_objects,
