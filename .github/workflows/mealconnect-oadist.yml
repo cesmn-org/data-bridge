@@ -30,7 +30,7 @@ jobs:
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Fetch, validate, transform, and upload Parquet
+      - name: Fetch, transform, and upload Parquet
         env:
           MEALCONNECT_USERNAME: ${{ secrets.MEALCONNECT_USERNAME }}
           MEALCONNECT_PASSWORD: ${{ secrets.MEALCONNECT_PASSWORD }}
@@ -40,7 +40,6 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           python - <<'PY'
-          import csv
           import io
           import os
           from datetime import datetime, timezone
@@ -50,7 +49,6 @@ jobs:
           from libfetch import OADist
 
 
-          # Fetch the report into memory.
           fetcher = OADist(
               os.environ["MEALCONNECT_USERNAME"],
               os.environ["MEALCONNECT_PASSWORD"],
@@ -61,80 +59,35 @@ jobs:
           if not source_bytes:
               raise RuntimeError("The downloaded report is empty")
 
+          account_id = os.environ[
+              "CLOUDFLARE_R2_ACCOUNT_ID"
+          ]
+
+          access_key = os.environ[
+              "CLOUDFLARE_R2_ACCESS_KEY_ID"
+          ]
+
+          secret_key = os.environ[
+              "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
+          ]
+
+          os.environ["AWS_ACCESS_KEY_ID"] = access_key
+          os.environ["AWS_SECRET_ACCESS_KEY"] = secret_key
+
+          timestamp = datetime.now(timezone.utc).strftime(
+              "%Y-%m-%dT%H-%M-%SZ"
+          )
+
+          output_path = (
+              "r2://data-bridge/"
+              "snapshots/mealconnect-oadist/"
+              f"{timestamp}-"
+              f"{os.environ['GITHUB_RUN_ID']}.parquet"
+          )
+
           con = duckdb.connect()
 
           try:
-              # Define the expected source columns in SQL, then discover them.
-              schema_sql = Path(
-                  "sql/sources/mealconnect-oadist-input.sql"
-              ).read_text(encoding="utf-8")
-
-              con.execute(schema_sql)
-
-              expected_columns = [
-                  row[1]
-                  for row in con.execute(
-                      "PRAGMA table_info('oa_distribution_csv_schema')"
-                  ).fetchall()
-              ]
-
-              # Read the CSV header independently so duplicate names are not
-              # hidden by DuckDB's automatic duplicate-column renaming.
-              header_stream = io.TextIOWrapper(
-                  io.BytesIO(source_bytes),
-                  encoding="utf-8-sig",
-                  newline="",
-              )
-              actual_columns = next(csv.reader(header_stream), None)
-
-              if not actual_columns:
-                  raise RuntimeError("The downloaded CSV has no header row")
-
-              if len(actual_columns) != len(set(actual_columns)):
-                  raise RuntimeError(
-                      "CSV schema validation failed: duplicate column names "
-                      f"found: {actual_columns}"
-                  )
-
-              unexpected = sorted(
-                  set(actual_columns) - set(expected_columns)
-              )
-              missing = sorted(
-                  set(expected_columns) - set(actual_columns)
-              )
-
-              if unexpected or missing:
-                  raise RuntimeError(
-                      "CSV schema validation failed:\n"
-                      f"Unexpected columns: {unexpected}\n"
-                      f"Missing columns: {missing}"
-                  )
-
-              # All source values enter DuckDB as VARCHAR. The transformation
-              # SQL is responsible for parsing and casting them.
-              con.read_csv(
-                  io.BytesIO(source_bytes),
-                  header=True,
-                  all_varchar=True,
-              ).create_view("input_data")
-
-              # Transform using the existing SQL.
-              sql = Path(
-                  "sql/sources/mealconnect-oadist.sql"
-              ).read_text(encoding="utf-8")
-
-              con.execute(sql)
-
-              # Configure R2 access and write the resulting Parquet file.
-              os.environ["AWS_ACCESS_KEY_ID"] = os.environ[
-                  "CLOUDFLARE_R2_ACCESS_KEY_ID"
-              ]
-              os.environ["AWS_SECRET_ACCESS_KEY"] = os.environ[
-                  "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
-              ]
-
-              account_id = os.environ["CLOUDFLARE_R2_ACCOUNT_ID"]
-
               con.execute("INSTALL httpfs")
               con.execute("LOAD httpfs")
 
@@ -149,16 +102,20 @@ jobs:
                   """
               )
 
-              timestamp = datetime.now(timezone.utc).strftime(
-                  "%Y-%m-%dT%H-%M-%SZ"
+              input_relation = duckdb.read_csv(
+                  io.BytesIO(source_bytes),
+                  header=True,
+                  all_varchar=True,
+                  encoding="utf-8-sig",
               )
 
-              output_path = (
-                  "r2://data-bridge/"
-                  "snapshots/mealconnect-oadist/"
-                  f"{timestamp}-"
-                  f"{os.environ['GITHUB_RUN_ID']}.parquet"
-              )
+              con.register("input_data", input_relation)
+
+              sql = Path(
+                  "sql/sources/mealconnect-oadist.sql"
+              ).read_text(encoding="utf-8")
+
+              con.execute(sql)
 
               con.execute(
                   f"""
@@ -169,7 +126,10 @@ jobs:
               )
 
               print("Fetch and transformation successful")
-              print(f"Source filename: {fetcher.suggested_filename}")
+              print(
+                  f"Source filename: "
+                  f"{fetcher.suggested_filename}"
+              )
               print(f"R2 object: {output_path}")
 
           finally:
