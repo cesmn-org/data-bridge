@@ -1,4 +1,5 @@
 import os
+import sys
 from importlib.util import module_from_spec
 from importlib.util import spec_from_file_location
 from pathlib import Path
@@ -8,10 +9,14 @@ BUCKET = "data-bridge"
 SNAPSHOT_PREFIX = "snapshots/"
 R2_SECRET_NAME = "data_bridge_r2"
 
-CONTRACTS_DIRECTORY = (
-    Path(__file__).resolve().parent.parent
-    / "contracts"
-)
+PROJECT_DIRECTORY = Path(__file__).resolve().parent.parent
+
+CONTRACTS_DIRECTORY = PROJECT_DIRECTORY / "contracts"
+
+# Contracts are dynamically loaded from file paths, so Python does not
+# automatically add the project root to sys.path for their imports.
+if str(PROJECT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIRECTORY))
 
 
 def required_environment(name: str) -> str:
