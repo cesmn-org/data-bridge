@@ -106,7 +106,6 @@ jobs:
                   io.BytesIO(source_bytes),
                   header=True,
                   all_varchar=True,
-                  encoding="utf-8-sig",
               )
 
               con.register("input_data", input_relation)
