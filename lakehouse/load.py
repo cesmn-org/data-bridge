@@ -2,8 +2,16 @@ import os
 
 
 BUCKET = "data-bridge"
-SNAPSHOT_PREFIX = "snapshots/mealconnect-oadist/"
-TABLE_NAME = "oa_distribution"
+SNAPSHOT_PREFIX = "snapshots/"
+OA_DISTRIBUTION_PREFIX = (
+    "snapshots/mealconnect-oadist/"
+)
+ANONYMOUS_PROGRAMS_PREFIX = (
+    "snapshots/webdav-log-anonymous-programs/"
+)
+
+OA_DISTRIBUTION_TABLE = "oa_distribution"
+ANONYMOUS_PROGRAMS_TABLE = "log_anonymous_programs"
 R2_SECRET_NAME = "data_bridge_r2"
 
 
@@ -54,9 +62,7 @@ def configure_r2_secret(con) -> None:
         "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
     )
 
-    snapshot_scope = (
-        f"r2://{BUCKET}/{SNAPSHOT_PREFIX}"
-    )
+    snapshot_scope = f"r2://{BUCKET}/{SNAPSHOT_PREFIX}"
 
     con.execute(
         f"""
@@ -86,12 +92,13 @@ def select_ducklake_database(con) -> str:
 
 def load_oa_distribution(con) -> int:
     snapshot_glob = (
-        f"r2://{BUCKET}/{SNAPSHOT_PREFIX}*.parquet"
+        f"r2://{BUCKET}/"
+        f"{OA_DISTRIBUTION_PREFIX}*.parquet"
     )
 
     con.execute(
         f"""
-        CREATE OR REPLACE TABLE {TABLE_NAME} AS
+        CREATE OR REPLACE TABLE {OA_DISTRIBUTION_TABLE} AS
         SELECT
             order_type,
             order_location,
@@ -134,13 +141,69 @@ def load_oa_distribution(con) -> int:
     row_count = con.execute(
         f"""
         SELECT COUNT(*)
-        FROM {TABLE_NAME}
+        FROM {OA_DISTRIBUTION_TABLE}
         """
     ).fetchone()[0]
 
     if row_count == 0:
         raise RuntimeError(
-            f"MotherDuck table is empty: {TABLE_NAME}"
+            "MotherDuck table is empty: "
+            f"{OA_DISTRIBUTION_TABLE}"
+        )
+
+    return row_count
+
+
+def load_anonymous_programs(con) -> int:
+    snapshot_glob = (
+        f"r2://{BUCKET}/"
+        f"{ANONYMOUS_PROGRAMS_PREFIX}*.parquet"
+    )
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {ANONYMOUS_PROGRAMS_TABLE} AS
+        SELECT
+            service_date,
+            program,
+            households,
+            children,
+            adults,
+            seniors,
+            pounds,
+            note
+        FROM (
+            SELECT
+                service_date,
+                program,
+                households,
+                children,
+                adults,
+                seniors,
+                pounds,
+                note,
+                filename,
+                MAX(filename) OVER () AS latest_filename
+            FROM read_parquet(
+                {sql_string(snapshot_glob)},
+                filename = true
+            )
+        )
+        WHERE filename = latest_filename
+        """
+    )
+
+    row_count = con.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM {ANONYMOUS_PROGRAMS_TABLE}
+        """
+    ).fetchone()[0]
+
+    if row_count == 0:
+        raise RuntimeError(
+            "MotherDuck table is empty: "
+            f"{ANONYMOUS_PROGRAMS_TABLE}"
         )
 
     return row_count
@@ -153,9 +216,15 @@ def main() -> None:
         configure_r2_secret(con)
         database_name = select_ducklake_database(con)
 
-        row_count = load_oa_distribution(con)
+        oa_distribution_row_count = (
+            load_oa_distribution(con)
+        )
 
-        sample_rows = con.execute(
+        anonymous_programs_row_count = (
+            load_anonymous_programs(con)
+        )
+
+        oa_distribution_sample = con.execute(
             f"""
             SELECT
                 order_type,
@@ -164,8 +233,24 @@ def main() -> None:
                 item_name,
                 total_pounds,
                 is_tefap
-            FROM {TABLE_NAME}
+            FROM {OA_DISTRIBUTION_TABLE}
             ORDER BY distribution_date, item_name
+            LIMIT 5
+            """
+        ).fetchall()
+
+        anonymous_programs_sample = con.execute(
+            f"""
+            SELECT
+                service_date,
+                program,
+                households,
+                children,
+                adults,
+                seniors,
+                pounds
+            FROM {ANONYMOUS_PROGRAMS_TABLE}
+            ORDER BY service_date, program
             LIMIT 5
             """
         ).fetchall()
@@ -175,11 +260,27 @@ def main() -> None:
 
     print("MotherDuck DuckLake load successful")
     print(f"Database: {database_name}")
-    print(f"Table: {TABLE_NAME}")
-    print(f"Rows: {row_count}")
+
+    print(
+        f"Table: {OA_DISTRIBUTION_TABLE}"
+    )
+    print(
+        f"Rows: {oa_distribution_row_count}"
+    )
     print("Sample rows:")
 
-    for row in sample_rows:
+    for row in oa_distribution_sample:
+        print(row)
+
+    print(
+        f"Table: {ANONYMOUS_PROGRAMS_TABLE}"
+    )
+    print(
+        f"Rows: {anonymous_programs_row_count}"
+    )
+    print("Sample rows:")
+
+    for row in anonymous_programs_sample:
         print(row)
 
 
