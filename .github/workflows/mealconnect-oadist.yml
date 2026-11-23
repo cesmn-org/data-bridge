@@ -48,6 +48,7 @@ jobs:
           import duckdb
           from libfetch import OADist
 
+
           expected_columns = [
               "OrderType",
               "OrderLocation",
@@ -91,15 +92,14 @@ jobs:
                       f"Actual:   {actual_columns}"
                   )
 
-              os.environ["AWS_ACCESS_KEY_ID"] = os.environ[
-                  "CLOUDFLARE_R2_ACCESS_KEY_ID"
-              ]
-              os.environ["AWS_SECRET_ACCESS_KEY"] = os.environ[
-                  "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
-              ]
-
               account_id = os.environ[
                   "CLOUDFLARE_R2_ACCOUNT_ID"
+              ]
+              access_key = os.environ[
+                  "CLOUDFLARE_R2_ACCESS_KEY_ID"
+              ]
+              secret_key = os.environ[
+                  "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
               ]
 
               timestamp = datetime.now(timezone.utc).strftime(
@@ -123,8 +123,9 @@ jobs:
                       f"""
                       CREATE OR REPLACE SECRET r2_secret (
                           TYPE R2,
-                          PROVIDER credential_chain,
-                          CHAIN 'env',
+                          PROVIDER config,
+                          KEY_ID '{access_key}',
+                          SECRET '{secret_key}',
                           ACCOUNT_ID '{account_id}'
                       )
                       """
@@ -151,7 +152,10 @@ jobs:
                   )
 
                   print("Fetch and transformation successful")
-                  print(f"Source filename: {fetcher.suggested_filename}")
+                  print(
+                      f"Source filename: "
+                      f"{fetcher.suggested_filename}"
+                  )
                   print(f"R2 object: {output_path}")
 
               finally:
