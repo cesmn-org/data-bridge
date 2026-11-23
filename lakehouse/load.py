@@ -13,10 +13,18 @@ ANONYMOUS_PROGRAMS_PREFIX = (
 RESCUE_PREFIX = (
     "snapshots/webdav-log-rescue/"
 )
+WAREHOUSE_INCOMING_PREFIX = (
+    "snapshots/webdav-log-warehouse-incoming/"
+)
+WAREHOUSE_OUTGOING_PREFIX = (
+    "snapshots/webdav-log-warehouse-outgoing/"
+)
 
 OA_DISTRIBUTION_TABLE = "oa_distribution"
 ANONYMOUS_PROGRAMS_TABLE = "log_anonymous_programs"
 RESCUE_TABLE = "log_rescue"
+WAREHOUSE_INCOMING_TABLE = "log_warehouse_incoming"
+WAREHOUSE_OUTGOING_TABLE = "log_warehouse_outgoing"
 
 R2_SECRET_NAME = "data_bridge_r2"
 
@@ -33,7 +41,6 @@ def required_environment(name: str) -> str:
 
 
 def sql_string(value: str) -> str:
-    """Quote a value for use as a SQL string literal."""
     return "'" + value.replace("'", "''") + "'"
 
 
@@ -84,9 +91,9 @@ def select_ducklake_database(con) -> str:
         "MOTHERDUCK_DUCKLAKE_NAME"
     )
 
-    con.execute(
-        f'USE "{database_name.replace(chr(34), chr(34) * 2)}"'
-    )
+    escaped_name = database_name.replace('"', '""')
+
+    con.execute(f'USE "{escaped_name}"')
 
     return database_name
 
@@ -139,20 +146,10 @@ def load_oa_distribution(con) -> int:
         """
     )
 
-    row_count = con.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM {OA_DISTRIBUTION_TABLE}
-        """
-    ).fetchone()[0]
-
-    if row_count == 0:
-        raise RuntimeError(
-            "MotherDuck table is empty: "
-            f"{OA_DISTRIBUTION_TABLE}"
-        )
-
-    return row_count
+    return require_nonempty_table(
+        con,
+        OA_DISTRIBUTION_TABLE,
+    )
 
 
 def load_anonymous_programs(con) -> int:
@@ -194,20 +191,10 @@ def load_anonymous_programs(con) -> int:
         """
     )
 
-    row_count = con.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM {ANONYMOUS_PROGRAMS_TABLE}
-        """
-    ).fetchone()[0]
-
-    if row_count == 0:
-        raise RuntimeError(
-            "MotherDuck table is empty: "
-            f"{ANONYMOUS_PROGRAMS_TABLE}"
-        )
-
-    return row_count
+    return require_nonempty_table(
+        con,
+        ANONYMOUS_PROGRAMS_TABLE,
+    )
 
 
 def load_rescue(con) -> int:
@@ -253,17 +240,101 @@ def load_rescue(con) -> int:
         """
     )
 
+    return require_nonempty_table(
+        con,
+        RESCUE_TABLE,
+    )
+
+
+def load_warehouse_incoming(con) -> int:
+    snapshot_glob = (
+        f"r2://{BUCKET}/"
+        f"{WAREHOUSE_INCOMING_PREFIX}*.parquet"
+    )
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {WAREHOUSE_INCOMING_TABLE} AS
+        SELECT
+            transaction_date,
+            source,
+            transaction_type,
+            product_type,
+            pounds,
+            note
+        FROM (
+            SELECT
+                transaction_date,
+                source,
+                transaction_type,
+                product_type,
+                pounds,
+                note,
+                filename,
+                MAX(filename) OVER () AS latest_filename
+            FROM read_parquet(
+                {sql_string(snapshot_glob)},
+                filename = true
+            )
+        )
+        WHERE filename = latest_filename
+        """
+    )
+
+    return require_nonempty_table(
+        con,
+        WAREHOUSE_INCOMING_TABLE,
+    )
+
+
+def load_warehouse_outgoing(con) -> int:
+    snapshot_glob = (
+        f"r2://{BUCKET}/"
+        f"{WAREHOUSE_OUTGOING_PREFIX}*.parquet"
+    )
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {WAREHOUSE_OUTGOING_TABLE} AS
+        SELECT
+            transaction_date,
+            product_type,
+            pounds,
+            note
+        FROM (
+            SELECT
+                transaction_date,
+                product_type,
+                pounds,
+                note,
+                filename,
+                MAX(filename) OVER () AS latest_filename
+            FROM read_parquet(
+                {sql_string(snapshot_glob)},
+                filename = true
+            )
+        )
+        WHERE filename = latest_filename
+        """
+    )
+
+    return require_nonempty_table(
+        con,
+        WAREHOUSE_OUTGOING_TABLE,
+    )
+
+
+def require_nonempty_table(con, table_name: str) -> int:
     row_count = con.execute(
         f"""
         SELECT COUNT(*)
-        FROM {RESCUE_TABLE}
+        FROM {table_name}
         """
     ).fetchone()[0]
 
     if row_count == 0:
         raise RuntimeError(
-            "MotherDuck table is empty: "
-            f"{RESCUE_TABLE}"
+            f"MotherDuck table is empty: {table_name}"
         )
 
     return row_count
@@ -279,59 +350,41 @@ def main() -> None:
         oa_distribution_row_count = (
             load_oa_distribution(con)
         )
-
         anonymous_programs_row_count = (
             load_anonymous_programs(con)
         )
-
         rescue_row_count = load_rescue(con)
+        warehouse_incoming_row_count = (
+            load_warehouse_incoming(con)
+        )
+        warehouse_outgoing_row_count = (
+            load_warehouse_outgoing(con)
+        )
 
-        oa_distribution_sample = con.execute(
+        warehouse_incoming_sample = con.execute(
             f"""
             SELECT
-                order_type,
-                order_location,
-                distribution_date,
-                item_name,
-                total_pounds,
-                is_tefap
-            FROM {OA_DISTRIBUTION_TABLE}
-            ORDER BY distribution_date, item_name
+                transaction_date,
+                source,
+                transaction_type,
+                product_type,
+                pounds,
+                note
+            FROM {WAREHOUSE_INCOMING_TABLE}
+            ORDER BY transaction_date, source
             LIMIT 5
             """
         ).fetchall()
 
-        anonymous_programs_sample = con.execute(
+        warehouse_outgoing_sample = con.execute(
             f"""
             SELECT
-                service_date,
-                program,
-                households,
-                children,
-                adults,
-                seniors,
-                pounds
-            FROM {ANONYMOUS_PROGRAMS_TABLE}
-            ORDER BY service_date, program
-            LIMIT 5
-            """
-        ).fetchall()
-
-        rescue_sample = con.execute(
-            f"""
-            SELECT
-                rescue_date,
-                location,
-                bakery,
-                dairy,
-                deli,
-                dry,
-                frozen,
-                nonfood,
-                produce,
-                total
-            FROM {RESCUE_TABLE}
-            ORDER BY rescue_date, location
+                transaction_date,
+                product_type,
+                pounds,
+                note
+            FROM {WAREHOUSE_OUTGOING_TABLE}
+            ORDER BY transaction_date, product_type
             LIMIT 5
             """
         ).fetchall()
@@ -342,25 +395,34 @@ def main() -> None:
     print("MotherDuck DuckLake load successful")
     print(f"Database: {database_name}")
 
-    print(f"Table: {OA_DISTRIBUTION_TABLE}")
-    print(f"Rows: {oa_distribution_row_count}")
-    print("Sample rows:")
+    print(
+        f"Table: {OA_DISTRIBUTION_TABLE}; "
+        f"rows: {oa_distribution_row_count}"
+    )
+    print(
+        f"Table: {ANONYMOUS_PROGRAMS_TABLE}; "
+        f"rows: {anonymous_programs_row_count}"
+    )
+    print(
+        f"Table: {RESCUE_TABLE}; "
+        f"rows: {rescue_row_count}"
+    )
+    print(
+        f"Table: {WAREHOUSE_INCOMING_TABLE}; "
+        f"rows: {warehouse_incoming_row_count}"
+    )
+    print("Sample incoming rows:")
 
-    for row in oa_distribution_sample:
+    for row in warehouse_incoming_sample:
         print(row)
 
-    print(f"Table: {ANONYMOUS_PROGRAMS_TABLE}")
-    print(f"Rows: {anonymous_programs_row_count}")
-    print("Sample rows:")
+    print(
+        f"Table: {WAREHOUSE_OUTGOING_TABLE}; "
+        f"rows: {warehouse_outgoing_row_count}"
+    )
+    print("Sample outgoing rows:")
 
-    for row in anonymous_programs_sample:
-        print(row)
-
-    print(f"Table: {RESCUE_TABLE}")
-    print(f"Rows: {rescue_row_count}")
-    print("Sample rows:")
-
-    for row in rescue_sample:
+    for row in warehouse_outgoing_sample:
         print(row)
 
 
