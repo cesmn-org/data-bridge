@@ -107,7 +107,7 @@ jobs:
               )
 
               output_path = (
-                  "s3://data-bridge/"
+                  "r2://data-bridge/"
                   "snapshots/mealconnect-oadist/"
                   f"{timestamp}-"
                   f"{os.environ['GITHUB_RUN_ID']}.parquet"
