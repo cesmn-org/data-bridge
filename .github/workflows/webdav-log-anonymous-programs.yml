@@ -108,17 +108,16 @@ jobs:
                   )
 
                   con.execute(
-                      """
+                      f"""
                       CREATE VIEW input_data AS
                       SELECT *
                       FROM read_xlsx(
-                          ?,
+                          '{source_file.name}',
                           sheet = 'Log Anonymous Programs',
                           range = 'A3:H',
                           all_varchar = true
                       )
-                      """,
-                      [source_file.name],
+                      """
                   )
 
                   sql = Path(
