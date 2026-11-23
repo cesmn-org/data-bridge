@@ -1,5 +1,7 @@
 import polars as pl
 
+from lakehouse.common import load_latest_snapshot
+
 
 RAW_COLUMNS = [
     "ID",
@@ -377,32 +379,14 @@ def load(
     sql_string,
     require_nonempty_table,
 ) -> int:
-    snapshot_glob = (
-        f"r2://{bucket}/"
-        f"{SNAPSHOT_PREFIX}*.parquet"
-    )
-
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE {TABLE_NAME} AS
-        SELECT * EXCLUDE (filename)
-        FROM read_parquet(
-            {sql_string(snapshot_glob)},
-            filename = true
-        )
-        WHERE filename = (
-            SELECT MAX(filename)
-            FROM read_parquet(
-                {sql_string(snapshot_glob)},
-                filename = true
-            )
-        )
-        """
-    )
-
-    return require_nonempty_table(
+    return load_latest_snapshot(
         con,
-        TABLE_NAME,
+        bucket=bucket,
+        snapshot_prefix=SNAPSHOT_PREFIX,
+        table_name=TABLE_NAME,
+        columns=OUTPUT_SCHEMA.names(),
+        sql_string=sql_string,
+        require_nonempty_table=require_nonempty_table,
     )
 
 

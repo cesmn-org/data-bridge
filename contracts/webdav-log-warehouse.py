@@ -2,6 +2,8 @@ from datetime import date
 
 import polars as pl
 
+from lakehouse.common import load_latest_snapshot
+
 
 RAW_INCOMING_COLUMNS = [
     "Date",
@@ -159,43 +161,14 @@ def load_incoming(
     sql_string,
     require_nonempty_table,
 ) -> int:
-    snapshot_glob = (
-        f"r2://{bucket}/"
-        f"{INCOMING_SNAPSHOT_PREFIX}*.parquet"
-    )
-
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE {INCOMING_TABLE_NAME} AS
-        SELECT
-            transaction_date,
-            source,
-            transaction_type,
-            product_type,
-            pounds,
-            note
-        FROM (
-            SELECT
-                transaction_date,
-                source,
-                transaction_type,
-                product_type,
-                pounds,
-                note,
-                filename,
-                MAX(filename) OVER () AS latest_filename
-            FROM read_parquet(
-                {sql_string(snapshot_glob)},
-                filename = true
-            )
-        )
-        WHERE filename = latest_filename
-        """
-    )
-
-    return require_nonempty_table(
+    return load_latest_snapshot(
         con,
-        INCOMING_TABLE_NAME,
+        bucket=bucket,
+        snapshot_prefix=INCOMING_SNAPSHOT_PREFIX,
+        table_name=INCOMING_TABLE_NAME,
+        columns=INCOMING_OUTPUT_SCHEMA.names(),
+        sql_string=sql_string,
+        require_nonempty_table=require_nonempty_table,
     )
 
 
@@ -205,39 +178,14 @@ def load_outgoing(
     sql_string,
     require_nonempty_table,
 ) -> int:
-    snapshot_glob = (
-        f"r2://{bucket}/"
-        f"{OUTGOING_SNAPSHOT_PREFIX}*.parquet"
-    )
-
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE {OUTGOING_TABLE_NAME} AS
-        SELECT
-            transaction_date,
-            product_type,
-            pounds,
-            note
-        FROM (
-            SELECT
-                transaction_date,
-                product_type,
-                pounds,
-                note,
-                filename,
-                MAX(filename) OVER () AS latest_filename
-            FROM read_parquet(
-                {sql_string(snapshot_glob)},
-                filename = true
-            )
-        )
-        WHERE filename = latest_filename
-        """
-    )
-
-    return require_nonempty_table(
+    return load_latest_snapshot(
         con,
-        OUTGOING_TABLE_NAME,
+        bucket=bucket,
+        snapshot_prefix=OUTGOING_SNAPSHOT_PREFIX,
+        table_name=OUTGOING_TABLE_NAME,
+        columns=OUTGOING_OUTPUT_SCHEMA.names(),
+        sql_string=sql_string,
+        require_nonempty_table=require_nonempty_table,
     )
 
 
