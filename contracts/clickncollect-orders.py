@@ -49,6 +49,15 @@ OUTPUT_SCHEMA = pl.Schema(
 )
 
 
+# Lakehouse loading contract
+
+SNAPSHOT_PREFIX = (
+    "snapshots/clickncollect-orders/"
+)
+
+TABLE_NAME = "click_n_collect_orders"
+
+
 def _nullable_string(column: str) -> pl.Expr:
     value = (
         pl.col(column)
@@ -132,3 +141,58 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         _nullable_datetime("Pick Up Date")
         .alias("pickup_datetime"),
     )
+
+
+def load(
+    con,
+    bucket: str,
+    sql_string,
+    require_nonempty_table,
+) -> int:
+    snapshot_glob = (
+        f"r2://{bucket}/"
+        f"{SNAPSHOT_PREFIX}*.parquet"
+    )
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {TABLE_NAME} AS
+        SELECT * EXCLUDE (filename)
+        FROM read_parquet(
+            {sql_string(snapshot_glob)},
+            filename = true
+        )
+        WHERE filename = (
+            SELECT MAX(filename)
+            FROM read_parquet(
+                {sql_string(snapshot_glob)},
+                filename = true
+            )
+        )
+        """
+    )
+
+    return require_nonempty_table(
+        con,
+        TABLE_NAME,
+    )
+
+
+def sample(con) -> list[tuple]:
+    return con.execute(
+        f"""
+        SELECT
+            location,
+            locker_terminal,
+            order_id,
+            tracking_id,
+            locker_number,
+            order_date,
+            locker_status,
+            delivery_datetime,
+            pickup_datetime
+        FROM {TABLE_NAME}
+        ORDER BY order_date, tracking_id
+        LIMIT 5
+        """
+    ).fetchall()
