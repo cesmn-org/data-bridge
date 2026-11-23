@@ -92,14 +92,15 @@ jobs:
                       f"Actual:   {actual_columns}"
                   )
 
-              account_id = os.environ[
-                  "CLOUDFLARE_R2_ACCOUNT_ID"
-              ]
-              access_key = os.environ[
+              os.environ["AWS_ACCESS_KEY_ID"] = os.environ[
                   "CLOUDFLARE_R2_ACCESS_KEY_ID"
               ]
-              secret_key = os.environ[
+              os.environ["AWS_SECRET_ACCESS_KEY"] = os.environ[
                   "CLOUDFLARE_R2_SECRET_ACCESS_KEY"
+              ]
+
+              account_id = os.environ[
+                  "CLOUDFLARE_R2_ACCOUNT_ID"
               ]
 
               timestamp = datetime.now(timezone.utc).strftime(
@@ -123,9 +124,8 @@ jobs:
                       f"""
                       CREATE OR REPLACE SECRET r2_secret (
                           TYPE R2,
-                          PROVIDER config,
-                          KEY_ID '{access_key}',
-                          SECRET '{secret_key}',
+                          PROVIDER credential_chain,
+                          CHAIN 'env',
                           ACCOUNT_ID '{account_id}'
                       )
                       """
