@@ -141,42 +141,40 @@ BOOLEAN_COLUMNS = [
 def _nullable_string(column: str) -> pl.Expr:
     value = (
         pl.col(column)
-        .cast(pl.String, strict=True)
+        .cast(pl.String, strict=False)
         .str.strip_chars()
     )
 
     return (
-        pl.when(value == "")
+        pl.when(value.is_null() | (value == ""))
         .then(pl.lit(None, dtype=pl.String))
         .otherwise(value)
     )
 
 
 def _nullable_integer(column: str) -> pl.Expr:
-    return (
-        _nullable_string(column)
-        .cast(pl.Int64, strict=True)
+    return _nullable_string(column).cast(
+        pl.Int64,
+        strict=True,
     )
 
 
 def _boolean(column: str) -> pl.Expr:
     value = (
         pl.col(column)
-        .cast(pl.String, strict=True)
+        .cast(pl.String, strict=False)
         .str.strip_chars()
         .str.to_lowercase()
     )
 
     return (
-        pl.when(value == "")
+        pl.when(value.is_null() | (value == ""))
         .then(pl.lit(None, dtype=pl.Boolean))
         .when(value == "true")
         .then(pl.lit(True))
         .when(value == "false")
         .then(pl.lit(False))
-        .otherwise(
-            pl.lit(None, dtype=pl.Boolean)
-        )
+        .otherwise(pl.lit(None, dtype=pl.Boolean))
     )
 
 
@@ -186,7 +184,8 @@ def _validate_boolean_values(df: pl.DataFrame) -> None:
     for column in BOOLEAN_COLUMNS:
         values = (
             df.get_column(column)
-            .cast(pl.String, strict=True)
+            .cast(pl.String, strict=False)
+            .fill_null("")
             .str.strip_chars()
             .str.to_lowercase()
             .unique()
@@ -194,7 +193,8 @@ def _validate_boolean_values(df: pl.DataFrame) -> None:
         )
 
         invalid = sorted(
-            value for value in values
+            value
+            for value in values
             if value not in allowed
         )
 
@@ -300,8 +300,10 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         .alias("birth_date"),
 
         _nullable_integer("Age").alias("age"),
+
         _boolean("NoFixedAddress")
         .alias("no_fixed_address"),
+
         _boolean("OkToContact")
         .alias("ok_to_contact"),
 
