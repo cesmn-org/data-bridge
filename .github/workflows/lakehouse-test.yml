@@ -1,3 +1,4 @@
+
 name: Inspect lakehouse metadata
 
 on:
@@ -82,15 +83,41 @@ jobs:
               (
                   "schemas",
                   """
-                  SELECT schema_id, schema_name, path, path_is_relative
+                  SELECT
+                      schema_id,
+                      schema_name,
+                      path,
+                      path_is_relative
                   FROM lake_metadata.main.ducklake_schema;
                   """,
               ),
               (
                   "tables",
                   """
-                  SELECT table_name, path, path_is_relative
+                  SELECT
+                      table_id,
+                      table_name,
+                      path,
+                      path_is_relative
                   FROM lake_metadata.main.ducklake_table;
+                  """,
+              ),
+              (
+                  "data_files",
+                  """
+                  SELECT
+                      s.schema_name,
+                      s.path AS schema_path,
+                      t.table_name,
+                      t.path AS table_path,
+                      f.path AS file_path,
+                      f.path_is_relative
+                  FROM lake_metadata.main.ducklake_schema s
+                  JOIN lake_metadata.main.ducklake_table t
+                      ON t.schema_id = s.schema_id
+                  JOIN lake_metadata.main.ducklake_data_file f
+                      ON f.table_id = t.table_id
+                  ORDER BY t.table_name, f.path;
                   """,
               ),
           ]
