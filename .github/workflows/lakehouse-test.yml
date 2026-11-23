@@ -60,7 +60,6 @@ jobs:
 
           connection.execute("INSTALL ducklake")
           connection.execute("LOAD ducklake")
-
           connection.execute(
               "ATTACH 'ducklake:/tmp/catalog.duckdb' AS lake"
           )
@@ -70,7 +69,7 @@ jobs:
                   "data_path",
                   """
                   SELECT key, value
-                  FROM lake.ducklake_metadata
+                  FROM lake.main.ducklake_metadata
                   WHERE key = 'data_path';
                   """,
               ),
@@ -78,14 +77,14 @@ jobs:
                   "schemas",
                   """
                   SELECT schema_id, schema_name, path, path_is_relative
-                  FROM lake.ducklake_schema;
+                  FROM lake.main.ducklake_schema;
                   """,
               ),
               (
                   "tables",
                   """
                   SELECT table_name, path, path_is_relative
-                  FROM lake.ducklake_table;
+                  FROM lake.main.ducklake_table;
                   """,
               ),
           ]
@@ -97,18 +96,18 @@ jobs:
               columns = [column[0] for column in result.description]
               rows = result.fetchall()
 
-              report_lines.append(f"--- {title} ---")
+              header = f"--- {title} ---"
+              report_lines.append(header)
               report_lines.append("\t".join(columns))
 
-              print(f"--- {title} ---")
+              print(header)
               print("\t".join(columns))
 
               for row in rows:
-                  values = [
+                  line = "\t".join(
                       "" if value is None else str(value)
                       for value in row
-                  ]
-                  line = "\t".join(values)
+                  )
                   report_lines.append(line)
                   print(line)
 
