@@ -1,40 +1,17 @@
 import os
+from importlib.util import module_from_spec
+from importlib.util import spec_from_file_location
+from pathlib import Path
 
 
 BUCKET = "data-bridge"
 SNAPSHOT_PREFIX = "snapshots/"
-
-OA_DISTRIBUTION_PREFIX = (
-    "snapshots/mealconnect-oadist/"
-)
-ANONYMOUS_PROGRAMS_PREFIX = (
-    "snapshots/webdav-log-anonymous-programs/"
-)
-RESCUE_PREFIX = (
-    "snapshots/webdav-log-rescue/"
-)
-WAREHOUSE_INCOMING_PREFIX = (
-    "snapshots/webdav-log-warehouse-incoming/"
-)
-WAREHOUSE_OUTGOING_PREFIX = (
-    "snapshots/webdav-log-warehouse-outgoing/"
-)
-OA_ORDERS_PREFIX = (
-    "snapshots/mealconnect-oaorders/"
-)
-CNC_ORDERS_PREFIX = (
-    "snapshots/clickncollect-orders/"
-)
-
-OA_DISTRIBUTION_TABLE = "oa_distribution"
-ANONYMOUS_PROGRAMS_TABLE = "log_anonymous_programs"
-RESCUE_TABLE = "log_rescue"
-WAREHOUSE_INCOMING_TABLE = "log_warehouse_incoming"
-WAREHOUSE_OUTGOING_TABLE = "log_warehouse_outgoing"
-OA_ORDERS_TABLE = "oa_orders"
-CNC_ORDERS_TABLE = "click_n_collect_orders"
-
 R2_SECRET_NAME = "data_bridge_r2"
+
+CONTRACTS_DIRECTORY = (
+    Path(__file__).resolve().parent.parent
+    / "contracts"
+)
 
 
 def required_environment(name: str) -> str:
@@ -50,6 +27,30 @@ def required_environment(name: str) -> str:
 
 def sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def load_contract(filename: str):
+    contract_path = CONTRACTS_DIRECTORY / filename
+
+    module_name = (
+        "data_bridge_contract_"
+        + filename.replace("-", "_").replace(".", "_")
+    )
+
+    spec = spec_from_file_location(
+        module_name,
+        contract_path,
+    )
+
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            f"Could not load contract: {contract_path}"
+        )
+
+    contract = module_from_spec(spec)
+    spec.loader.exec_module(contract)
+
+    return contract
 
 
 def connect_to_motherduck():
@@ -116,7 +117,7 @@ def require_nonempty_table(
     row_count = con.execute(
         f"""
         SELECT COUNT(*)
-        FROM {table_name}
+        FROM "{table_name.replace('"', '""')}"
         """
     ).fetchone()[0]
 
@@ -128,293 +129,58 @@ def require_nonempty_table(
     return row_count
 
 
-def load_oa_distribution(con) -> int:
-    snapshot_glob = (
-        f"r2://{BUCKET}/"
-        f"{OA_DISTRIBUTION_PREFIX}*.parquet"
-    )
-
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE {OA_DISTRIBUTION_TABLE} AS
-        SELECT
-            order_type,
-            order_location,
-            distribution_date,
-            item_location,
-            item_name,
-            quantity,
-            unit_pounds,
-            total_pounds,
-            is_tefap
-        FROM (
-            SELECT
-                order_type,
-                order_location,
-                distribution_date,
-                item_location,
-                item_name,
-                quantity,
-                unit_pounds,
-                total_pounds,
-                is_tefap,
-                ROW_NUMBER() OVER (
-                    PARTITION BY
-                        distribution_date,
-                        order_type,
-                        order_location,
-                        item_location,
-                        item_name
-                    ORDER BY filename DESC
-                ) AS row_number
-            FROM read_parquet(
-                {sql_string(snapshot_glob)},
-                filename = true
-            )
-        )
-        WHERE row_number = 1
-        """
-    )
-
-    return require_nonempty_table(
-        con,
-        OA_DISTRIBUTION_TABLE,
+def load_contract_table(
+    contract,
+    con,
+) -> int:
+    return contract.load(
+        con=con,
+        bucket=BUCKET,
+        sql_string=sql_string,
+        require_nonempty_table=require_nonempty_table,
     )
 
 
-def load_anonymous_programs(con) -> int:
-    snapshot_glob = (
-        f"r2://{BUCKET}/"
-        f"{ANONYMOUS_PROGRAMS_PREFIX}*.parquet"
+def print_sample(
+    table_name: str,
+    row_count: int,
+    rows: list[tuple],
+) -> None:
+    print(
+        f"Table: {table_name}; "
+        f"rows: {row_count}"
     )
+    print("Sample rows:")
 
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE {ANONYMOUS_PROGRAMS_TABLE} AS
-        SELECT
-            service_date,
-            program,
-            households,
-            children,
-            adults,
-            seniors,
-            pounds,
-            note
-        FROM (
-            SELECT
-                service_date,
-                program,
-                households,
-                children,
-                adults,
-                seniors,
-                pounds,
-                note,
-                filename,
-                MAX(filename) OVER () AS latest_filename
-            FROM read_parquet(
-                {sql_string(snapshot_glob)},
-                filename = true
-            )
-        )
-        WHERE filename = latest_filename
-        """
-    )
-
-    return require_nonempty_table(
-        con,
-        ANONYMOUS_PROGRAMS_TABLE,
-    )
-
-
-def load_rescue(con) -> int:
-    snapshot_glob = (
-        f"r2://{BUCKET}/"
-        f"{RESCUE_PREFIX}*.parquet"
-    )
-
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE {RESCUE_TABLE} AS
-        SELECT
-            rescue_date,
-            location,
-            bakery,
-            dairy,
-            deli,
-            dry,
-            frozen,
-            nonfood,
-            produce,
-            total
-        FROM (
-            SELECT
-                rescue_date,
-                location,
-                bakery,
-                dairy,
-                deli,
-                dry,
-                frozen,
-                nonfood,
-                produce,
-                total,
-                filename,
-                MAX(filename) OVER () AS latest_filename
-            FROM read_parquet(
-                {sql_string(snapshot_glob)},
-                filename = true
-            )
-        )
-        WHERE filename = latest_filename
-        """
-    )
-
-    return require_nonempty_table(
-        con,
-        RESCUE_TABLE,
-    )
-
-
-def load_warehouse_incoming(con) -> int:
-    snapshot_glob = (
-        f"r2://{BUCKET}/"
-        f"{WAREHOUSE_INCOMING_PREFIX}*.parquet"
-    )
-
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE {WAREHOUSE_INCOMING_TABLE} AS
-        SELECT
-            transaction_date,
-            source,
-            transaction_type,
-            product_type,
-            pounds,
-            note
-        FROM (
-            SELECT
-                transaction_date,
-                source,
-                transaction_type,
-                product_type,
-                pounds,
-                note,
-                filename,
-                MAX(filename) OVER () AS latest_filename
-            FROM read_parquet(
-                {sql_string(snapshot_glob)},
-                filename = true
-            )
-        )
-        WHERE filename = latest_filename
-        """
-    )
-
-    return require_nonempty_table(
-        con,
-        WAREHOUSE_INCOMING_TABLE,
-    )
-
-
-def load_warehouse_outgoing(con) -> int:
-    snapshot_glob = (
-        f"r2://{BUCKET}/"
-        f"{WAREHOUSE_OUTGOING_PREFIX}*.parquet"
-    )
-
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE {WAREHOUSE_OUTGOING_TABLE} AS
-        SELECT
-            transaction_date,
-            product_type,
-            pounds,
-            note
-        FROM (
-            SELECT
-                transaction_date,
-                product_type,
-                pounds,
-                note,
-                filename,
-                MAX(filename) OVER () AS latest_filename
-            FROM read_parquet(
-                {sql_string(snapshot_glob)},
-                filename = true
-            )
-        )
-        WHERE filename = latest_filename
-        """
-    )
-
-    return require_nonempty_table(
-        con,
-        WAREHOUSE_OUTGOING_TABLE,
-    )
-
-
-def load_oa_orders(con) -> int:
-    snapshot_glob = (
-        f"r2://{BUCKET}/"
-        f"{OA_ORDERS_PREFIX}*.parquet"
-    )
-
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE {OA_ORDERS_TABLE} AS
-        SELECT * EXCLUDE (filename)
-        FROM read_parquet(
-            {sql_string(snapshot_glob)},
-            filename = true
-        )
-        WHERE filename = (
-            SELECT MAX(filename)
-            FROM read_parquet(
-                {sql_string(snapshot_glob)},
-                filename = true
-            )
-        )
-        """
-    )
-
-    return require_nonempty_table(
-        con,
-        OA_ORDERS_TABLE,
-    )
-
-
-def load_cnc_orders(con) -> int:
-    snapshot_glob = (
-        f"r2://{BUCKET}/"
-        f"{CNC_ORDERS_PREFIX}*.parquet"
-    )
-
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE {CNC_ORDERS_TABLE} AS
-        SELECT * EXCLUDE (filename)
-        FROM read_parquet(
-            {sql_string(snapshot_glob)},
-            filename = true
-        )
-        WHERE filename = (
-            SELECT MAX(filename)
-            FROM read_parquet(
-                {sql_string(snapshot_glob)},
-                filename = true
-            )
-        )
-        """
-    )
-
-    return require_nonempty_table(
-        con,
-        CNC_ORDERS_TABLE,
-    )
+    for row in rows:
+        print(row)
 
 
 def main() -> None:
+    mealconnect_oadist = load_contract(
+        "mealconnect-oadist.py"
+    )
+
+    webdav_anonymous_programs = load_contract(
+        "webdav-log-anonymous-programs.py"
+    )
+
+    webdav_rescue = load_contract(
+        "webdav-log-rescue.py"
+    )
+
+    webdav_warehouse = load_contract(
+        "webdav-log-warehouse.py"
+    )
+
+    mealconnect_oaorders = load_contract(
+        "mealconnect-oaorders.py"
+    )
+
+    clickncollect_orders = load_contract(
+        "clickncollect-orders.py"
+    )
+
     con = connect_to_motherduck()
 
     try:
@@ -422,90 +188,81 @@ def main() -> None:
         database_name = select_ducklake_database(con)
 
         oa_distribution_row_count = (
-            load_oa_distribution(con)
+            load_contract_table(
+                mealconnect_oadist,
+                con,
+            )
         )
 
         anonymous_programs_row_count = (
-            load_anonymous_programs(con)
+            load_contract_table(
+                webdav_anonymous_programs,
+                con,
+            )
         )
 
-        rescue_row_count = load_rescue(con)
+        rescue_row_count = load_contract_table(
+            webdav_rescue,
+            con,
+        )
 
         warehouse_incoming_row_count = (
-            load_warehouse_incoming(con)
+            webdav_warehouse.load_incoming(
+                con=con,
+                bucket=BUCKET,
+                sql_string=sql_string,
+                require_nonempty_table=(
+                    require_nonempty_table
+                ),
+            )
         )
 
         warehouse_outgoing_row_count = (
-            load_warehouse_outgoing(con)
+            webdav_warehouse.load_outgoing(
+                con=con,
+                bucket=BUCKET,
+                sql_string=sql_string,
+                require_nonempty_table=(
+                    require_nonempty_table
+                ),
+            )
         )
 
-        oa_orders_row_count = load_oa_orders(con)
+        oa_orders_row_count = load_contract_table(
+            mealconnect_oaorders,
+            con,
+        )
 
-        cnc_orders_row_count = load_cnc_orders(con)
+        cnc_orders_row_count = load_contract_table(
+            clickncollect_orders,
+            con,
+        )
 
-        warehouse_incoming_sample = con.execute(
-            f"""
-            SELECT
-                transaction_date,
-                source,
-                transaction_type,
-                product_type,
-                pounds,
-                note
-            FROM {WAREHOUSE_INCOMING_TABLE}
-            ORDER BY transaction_date, source
-            LIMIT 5
-            """
-        ).fetchall()
+        oa_distribution_sample = (
+            mealconnect_oadist.sample(con)
+        )
 
-        warehouse_outgoing_sample = con.execute(
-            f"""
-            SELECT
-                transaction_date,
-                product_type,
-                pounds,
-                note
-            FROM {WAREHOUSE_OUTGOING_TABLE}
-            ORDER BY transaction_date, product_type
-            LIMIT 5
-            """
-        ).fetchall()
+        anonymous_programs_sample = (
+            webdav_anonymous_programs.sample(con)
+        )
 
-        oa_orders_sample = con.execute(
-            f"""
-            SELECT
-                client_id,
-                order_id,
-                order_number,
-                order_status,
-                place_of_service,
-                date_of_service,
-                household_size,
-                gender_identity,
-                race_ethnicity
-            FROM {OA_ORDERS_TABLE}
-            ORDER BY created, order_number
-            LIMIT 5
-            """
-        ).fetchall()
+        rescue_sample = webdav_rescue.sample(con)
 
-        cnc_orders_sample = con.execute(
-            f"""
-            SELECT
-                location,
-                locker_terminal,
-                order_id,
-                tracking_id,
-                locker_number,
-                order_date,
-                locker_status,
-                delivery_datetime,
-                pickup_datetime
-            FROM {CNC_ORDERS_TABLE}
-            ORDER BY order_date, tracking_id
-            LIMIT 5
-            """
-        ).fetchall()
+        warehouse_incoming_sample = (
+            webdav_warehouse.sample_incoming(con)
+        )
+
+        warehouse_outgoing_sample = (
+            webdav_warehouse.sample_outgoing(con)
+        )
+
+        oa_orders_sample = (
+            mealconnect_oaorders.sample(con)
+        )
+
+        cnc_orders_sample = (
+            clickncollect_orders.sample(con)
+        )
 
     finally:
         con.close()
@@ -513,56 +270,47 @@ def main() -> None:
     print("MotherDuck DuckLake load successful")
     print(f"Database: {database_name}")
 
-    print(
-        f"Table: {OA_DISTRIBUTION_TABLE}; "
-        f"rows: {oa_distribution_row_count}"
+    print_sample(
+        mealconnect_oadist.TABLE_NAME,
+        oa_distribution_row_count,
+        oa_distribution_sample,
     )
 
-    print(
-        f"Table: {ANONYMOUS_PROGRAMS_TABLE}; "
-        f"rows: {anonymous_programs_row_count}"
+    print_sample(
+        webdav_anonymous_programs.TABLE_NAME,
+        anonymous_programs_row_count,
+        anonymous_programs_sample,
     )
 
-    print(
-        f"Table: {RESCUE_TABLE}; "
-        f"rows: {rescue_row_count}"
+    print_sample(
+        webdav_rescue.TABLE_NAME,
+        rescue_row_count,
+        rescue_sample,
     )
 
-    print(
-        f"Table: {WAREHOUSE_INCOMING_TABLE}; "
-        f"rows: {warehouse_incoming_row_count}"
+    print_sample(
+        webdav_warehouse.INCOMING_TABLE_NAME,
+        warehouse_incoming_row_count,
+        warehouse_incoming_sample,
     )
-    print("Sample incoming rows:")
 
-    for row in warehouse_incoming_sample:
-        print(row)
-
-    print(
-        f"Table: {WAREHOUSE_OUTGOING_TABLE}; "
-        f"rows: {warehouse_outgoing_row_count}"
+    print_sample(
+        webdav_warehouse.OUTGOING_TABLE_NAME,
+        warehouse_outgoing_row_count,
+        warehouse_outgoing_sample,
     )
-    print("Sample outgoing rows:")
 
-    for row in warehouse_outgoing_sample:
-        print(row)
-
-    print(
-        f"Table: {OA_ORDERS_TABLE}; "
-        f"rows: {oa_orders_row_count}"
+    print_sample(
+        mealconnect_oaorders.TABLE_NAME,
+        oa_orders_row_count,
+        oa_orders_sample,
     )
-    print("Sample OA Orders rows:")
 
-    for row in oa_orders_sample:
-        print(row)
-
-    print(
-        f"Table: {CNC_ORDERS_TABLE}; "
-        f"rows: {cnc_orders_row_count}"
+    print_sample(
+        clickncollect_orders.TABLE_NAME,
+        cnc_orders_row_count,
+        cnc_orders_sample,
     )
-    print("Sample Click N Collect rows:")
-
-    for row in cnc_orders_sample:
-        print(row)
 
 
 if __name__ == "__main__":
